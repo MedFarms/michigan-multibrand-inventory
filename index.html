@@ -1354,25 +1354,6 @@ function InventoryDashboard({
     className: "filter-group"
   }, /*#__PURE__*/React.createElement("label", {
     className: "filter-label"
-  }, "Status"), /*#__PURE__*/React.createElement("select", {
-    className: "filter-select",
-    value: filters.status,
-    onChange: e => {
-      const v = e.target.value;
-      upd('status', v);
-      setInvMetric(v === 'Reserved' ? 'reserved' : v.toLowerCase() === 'available' ? 'available' : 'onhand');
-    }
-  }, /*#__PURE__*/React.createElement("option", {
-    value: ""
-  }, "All"), distinct.statuses.map(b => /*#__PURE__*/React.createElement("option", {
-    key: b,
-    value: b
-  }, b.charAt(0).toUpperCase() + b.slice(1))), /*#__PURE__*/React.createElement("option", {
-    value: "Reserved"
-  }, "Reserved"))), /*#__PURE__*/React.createElement("div", {
-    className: "filter-group"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "filter-label"
   }, "Stock"), /*#__PURE__*/React.createElement("select", {
     className: "filter-select",
     value: filters.stock,
