@@ -69,7 +69,6 @@ function App() {
         })
         .then(buf => {
           const bytes = new Uint8Array(buf);
-          // Check if gzipped (starts with 1f 8b)
           let text;
           if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
             text = pako.ungzip(bytes, { to: 'string' });
@@ -83,7 +82,7 @@ function App() {
     load();
   }, []);
 
-  if (error) return <div className="app"><div className="error-box">Error loading inventory data:<br/>{error}<br/><br/>Make sure you have run the scraper and the sales_data.json.gz file exists in this repo.</div></div>;
+  if (error) return <div className="app"><div className="error-box">Error: {error}</div></div>;
   if (!data) return <div className="app"><div className="loading">Loading inventory…</div></div>;
 
   return <InventoryDash data={data} filters={filters} setFilters={setFilters} />;
@@ -92,16 +91,16 @@ function App() {
 function InventoryDash({ data, filters, setFilters }) {
   const upd = (k, v) => setFilters(f => ({...f, [k]: v}));
 
-  // Parse inventory from rows
+  // Parse inventory from the inventory array (not rows!)
   const inv = useMemo(() => {
-    const rows = data.rows || [];
+    const inventory = data.inventory || [];
     const byBrand = {};
-    const allProds = [];
+    const allOosProds = [];
 
-    rows.forEach(r => {
-      const brand = r.product_brand || r.brand || '';
-      const onHand = parseInt(r.on_hand) || 0;
-      const reserved = parseInt(r.reserved) || 0;
+    inventory.forEach(item => {
+      const brand = item.brand || '';
+      const onHand = parseFloat(item.inventory) || 0;
+      const reserved = parseFloat(item.reserved) || 0;
 
       if (brand && BRAND_COLORS[brand]) {
         if (!byBrand[brand]) {
@@ -109,11 +108,10 @@ function InventoryDash({ data, filters, setFilters }) {
         }
         byBrand[brand].onHand += onHand;
         byBrand[brand].reserved += reserved;
-        byBrand[brand].skus.add(r.sku);
-        if (onHand <= 0) byBrand[brand].oosCount += 1;
-
+        byBrand[brand].skus.add(item.sku);
         if (onHand <= 0) {
-          allProds.push({ sku: r.sku, name: r.product_name, brand });
+          byBrand[brand].oosCount += 1;
+          allOosProds.push({ sku: item.sku, name: item.name, brand });
         }
       }
     });
@@ -127,7 +125,7 @@ function InventoryDash({ data, filters, setFilters }) {
       skus: d.skus.size,
     }));
 
-    return { brands, oosProds: allProds };
+    return { brands, oosProds: allOosProds };
   }, [data]);
 
   const filteredOos = useMemo(() => {
