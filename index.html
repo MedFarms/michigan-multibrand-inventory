@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/pako@2.1.0/dist/pako.min.js"></script>
 <style>
 :root { --bg: #DAB1DA; --bg-elev: #e2e1e8; --text: #2c1b3d; --text-dim: #5e4a72; --text-faint: #8a76a0; --accent: #a82d8a; --border: #d4c4d4; --border-soft: #e8e3e8; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -22,7 +23,6 @@ html, body { background: var(--bg); color: var(--text); font-family: 'Inter', sa
 .section-title { font-size: 20px; font-weight: 500; }
 .section-title em { color: var(--text-dim); font-style: italic; font-weight: 400; }
 .card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 24px; }
-.card-grid { display: grid; gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))'; gap: 16px; }
 .brand-card { border-top: 3px solid; padding: 20px 18px; display: flex; flex-direction: column; gap: 12px; }
 .brand-name { font-size: 16px; font-weight: 500; }
 .metric { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
@@ -32,7 +32,8 @@ html, body { background: var(--bg); color: var(--text); font-family: 'Inter', sa
 .data-table td { padding: 12px 16px; border-bottom: 1px solid var(--border-soft); }
 .data-table .dim { color: var(--text-dim); }
 .empty-msg { padding: 20px; color: var(--text-faint); text-align: center; }
-.error-box { padding: 20px; background: #fef0f0; border: 1px solid #d9b3b3; border-radius: 4px; color: #8b3333; font-size: 13px; }
+.error-box { padding: 20px; background: #fef0f0; border: 1px solid #d9b3b3; border-radius: 4px; color: #8b3333; font-size: 13px; line-height: 1.6; }
+.loading { padding: 60px 20px; text-align: center; color: var(--text-faint); }
 </style>
 </head>
 <body>
@@ -43,7 +44,7 @@ const { useState, useEffect, useMemo } = React;
 const BRAND_COLORS = { 
   'Hyman': '#ef8c3a', 
   'Chill Medicated': '#3f9ae0', 
-  'Covert Cups': '#c99e0a',  // ← DARKER YELLOW
+  'Covert Cups': '#c99e0a',  // DARKER YELLOW
   'Homiez': '#ff479e', 
   'Value Pak Distro': '#f4f4f4', 
   '100 Shafer': '#68ba7f' 
@@ -60,44 +61,30 @@ function App() {
   const [filters, setFilters] = useState({ oosFilter: '' });
 
   useEffect(() => {
-    const load = async () => {
-      try {
-        // Try to fetch sales data
-        const res = await fetch('sales_data.json.gz' + '?t=' + Date.now());
-        if (!res.ok) {
-          setError('Could not load sales_data.json.gz. Make sure the scraper has been run.');
-          return;
-        }
-        const buf = await res.arrayBuffer();
-        // Decompress gzip
-        const ds = new DecompressionStream('gzip');
-        const reader = buf.stream();
-        const decompressed = reader.pipeThrough(ds);
-        const chunks = [];
-        const rd = decompressed.getReader();
-        while (true) {
-          const {done, value} = await rd.read();
-          if (done) break;
-          chunks.push(value);
-        }
-        const combined = new Uint8Array(chunks.reduce((a, c) => a + c.length, 0));
-        let pos = 0;
-        for (const chunk of chunks) {
-          combined.set(chunk, pos);
-          pos += chunk.length;
-        }
-        const text = new TextDecoder().decode(combined);
-        setData(JSON.parse(text));
-      } catch (e) {
-        setError('Error loading inventory data: ' + e.message);
-        console.error('Inventory load error:', e);
-      }
+    const load = () => {
+      fetch('sales_data.json.gz?t=' + Date.now())
+        .then(r => {
+          if (!r.ok) throw new Error('Could not load sales_data.json.gz (HTTP ' + r.status + ')');
+          return r.arrayBuffer();
+        })
+        .then(buf => {
+          const bytes = new Uint8Array(buf);
+          // Check if gzipped (starts with 1f 8b)
+          let text;
+          if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+            text = pako.ungzip(bytes, { to: 'string' });
+          } else {
+            text = new TextDecoder().decode(bytes);
+          }
+          setData(JSON.parse(text));
+        })
+        .catch(e => setError(e.message));
     };
     load();
   }, []);
 
-  if (error) return <div className="app"><div className="error-box">{error}</div></div>;
-  if (!data) return <div className="app"><div style={{padding: '20px', textAlign: 'center', color: 'var(--text-faint)'}}>Loading inventory…</div></div>;
+  if (error) return <div className="app"><div className="error-box">Error loading inventory data:<br/>{error}<br/><br/>Make sure you have run the scraper and the sales_data.json.gz file exists in this repo.</div></div>;
+  if (!data) return <div className="app"><div className="loading">Loading inventory…</div></div>;
 
   return <InventoryDash data={data} filters={filters} setFilters={setFilters} />;
 }
