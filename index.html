@@ -15,25 +15,19 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; font-size: 14px; line-height: 1.5; min-height: 100vh; }
 .app { max-width: 1400px; margin: 0 auto; padding: 32px 24px 120px; }
+.debug { background: #fff9f0; border: 2px solid #ff8c00; padding: 16px; margin: 20px 0; border-radius: 4px; font-family: monospace; font-size: 11px; line-height: 1.8; color: #333; max-height: 300px; overflow-y: auto; }
+.debug-title { font-weight: bold; color: #c65911; margin-bottom: 8px; }
 .topbar { display: flex; justify-content: space-between; align-items: center; padding-bottom: 20px; border-bottom: 1px solid var(--border); margin-bottom: 28px; }
 .topbar-title { font-size: 28px; font-weight: 600; }
 .topbar-meta { display: flex; gap: 12px; font-size: 12px; color: var(--text-faint); font-family: 'JetBrains Mono'; }
 .section { margin-bottom: 32px; }
-.section-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 12px; }
 .section-title { font-size: 20px; font-weight: 500; }
-.section-title em { color: var(--text-dim); font-style: italic; font-weight: 400; }
 .card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 24px; }
 .brand-card { border-top: 3px solid; padding: 20px 18px; display: flex; flex-direction: column; gap: 12px; }
 .brand-name { font-size: 16px; font-weight: 500; }
 .metric { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
 .metric-val { color: var(--text); font-family: 'JetBrains Mono'; font-weight: 500; }
-.data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.data-table th { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono'; font-size: 10px; text-transform: uppercase; color: var(--text-faint); font-weight: 500; }
-.data-table td { padding: 12px 16px; border-bottom: 1px solid var(--border-soft); }
-.data-table .dim { color: var(--text-dim); }
-.empty-msg { padding: 20px; color: var(--text-faint); text-align: center; }
-.error-box { padding: 20px; background: #fef0f0; border: 1px solid #d9b3b3; border-radius: 4px; color: #8b3333; font-size: 13px; line-height: 1.6; }
-.loading { padding: 60px 20px; text-align: center; color: var(--text-faint); }
+.loading { padding: 60px 20px; text-align: center; color: var(--text-faint); font-size: 16px; }
 </style>
 </head>
 <body>
@@ -44,7 +38,7 @@ const { useState, useEffect, useMemo } = React;
 const BRAND_COLORS = { 
   'Hyman': '#ef8c3a', 
   'Chill Medicated': '#3f9ae0', 
-  'Covert Cups': '#c99e0a',  // DARKER YELLOW
+  'Covert Cups': '#c99e0a',
   'Homiez': '#ff479e', 
   'Value Pak Distro': '#f4f4f4', 
   '100 Shafer': '#68ba7f' 
@@ -58,40 +52,89 @@ const brandColor = (b) => BRAND_COLORS[b] || '#9dc1a9';
 function App() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
+  const [debug, setDebug] = useState([]);
   const [filters, setFilters] = useState({ oosFilter: '' });
 
+  const addDebug = (msg) => {
+    console.log('[DEBUG]', msg);
+    setDebug(d => [...d, new Date().toLocaleTimeString() + ': ' + msg]);
+  };
+
   useEffect(() => {
-    const load = () => {
-      fetch('sales_data.json.gz?t=' + Date.now())
-        .then(r => {
-          if (!r.ok) throw new Error('Could not load sales_data.json.gz (HTTP ' + r.status + ')');
-          return r.arrayBuffer();
-        })
-        .then(buf => {
-          const bytes = new Uint8Array(buf);
-          let text;
-          if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
-            text = pako.ungzip(bytes, { to: 'string' });
-          } else {
-            text = new TextDecoder().decode(bytes);
-          }
-          setData(JSON.parse(text));
-        })
-        .catch(e => setError(e.message));
+    addDebug('Component mounted, starting fetch...');
+    
+    const load = async () => {
+      try {
+        const url = 'sales_data.json.gz?t=' + Date.now();
+        addDebug('Fetching: ' + url);
+        
+        const res = await fetch(url);
+        addDebug('Response status: ' + res.status);
+        
+        if (!res.ok) {
+          throw new Error('HTTP ' + res.status);
+        }
+        
+        const buf = await res.arrayBuffer();
+        addDebug('Got ' + buf.byteLength + ' bytes');
+        
+        const bytes = new Uint8Array(buf);
+        addDebug('First 2 bytes: 0x' + bytes[0].toString(16) + ' 0x' + bytes[1].toString(16));
+        
+        let text;
+        if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
+          addDebug('Data is gzipped, decompressing...');
+          text = pako.ungzip(bytes, { to: 'string' });
+          addDebug('Decompressed to ' + text.length + ' chars');
+        } else {
+          addDebug('Data not gzipped, reading as text...');
+          text = new TextDecoder().decode(bytes);
+        }
+        
+        const obj = JSON.parse(text);
+        addDebug('Parsed JSON. Keys: ' + Object.keys(obj).join(', '));
+        addDebug('Inventory items: ' + (obj.inventory ? obj.inventory.length : 'none'));
+        
+        setData(obj);
+        addDebug('Data loaded successfully!');
+      } catch (e) {
+        addDebug('ERROR: ' + e.message);
+        setError(e.message);
+      }
     };
+    
     load();
   }, []);
 
-  if (error) return <div className="app"><div className="error-box">Error: {error}</div></div>;
-  if (!data) return <div className="app"><div className="loading">Loading inventory…</div></div>;
+  if (error) return (
+    <div className="app">
+      <div style={{padding: '20px', background: '#fef0f0', border: '2px solid #d9b3b3', borderRadius: 4, color: '#8b3333'}}>
+        <strong>Error loading data:</strong> {error}
+        <div style={{marginTop: 12, fontSize: 12, maxHeight: 200, overflow: 'auto', background: '#fff', padding: 10, border: '1px solid #d9b3b3', borderRadius: 2}}>
+          {debug.map((d, i) => <div key={i} style={{fontFamily: 'monospace'}}>{d}</div>)}
+        </div>
+      </div>
+    </div>
+  );
+  
+  if (!data) return (
+    <div className="app">
+      <div className="loading">
+        Loading inventory…
+        <div className="debug">
+          <div className="debug-title">Debug Log:</div>
+          {debug.length === 0 ? 'Waiting for data...' : debug.map((d, i) => <div key={i}>{d}</div>)}
+        </div>
+      </div>
+    </div>
+  );
 
-  return <InventoryDash data={data} filters={filters} setFilters={setFilters} />;
+  return <InventoryDash data={data} filters={filters} setFilters={setFilters} debug={debug} />;
 }
 
-function InventoryDash({ data, filters, setFilters }) {
+function InventoryDash({ data, filters, setFilters, debug }) {
   const upd = (k, v) => setFilters(f => ({...f, [k]: v}));
 
-  // Parse inventory from the inventory array (not rows!)
   const inv = useMemo(() => {
     const inventory = data.inventory || [];
     const byBrand = {};
@@ -182,30 +225,29 @@ function InventoryDash({ data, filters, setFilters }) {
       </section>
 
       <section className="section">
-        <div className="section-header">
-          <h2 className="section-title">Out of Stock <em>· 0 units</em></h2>
-          <div style={{display: 'flex', gap: 12, alignItems: 'center'}}>
-            <span style={{fontSize: 11, color: 'var(--text-faint)', fontFamily: 'JetBrains Mono', textTransform: 'uppercase'}}>{fmtNum(filteredOos.length)} products</span>
-            <select value={filters.oosFilter} onChange={e => upd('oosFilter', e.target.value)} 
-              style={{padding: '6px 10px', fontSize: 12, background: 'var(--bg)', border: '1px solid var(--border)', color: 'var(--text)', borderRadius: 2, cursor: 'pointer'}}>
-              <option value="">All brands</option>
-              {brands.map(b => <option key={b} value={b}>{b}</option>)}
-            </select>
-          </div>
-        </div>
+        <h2 className="section-title">Out of Stock <em>· 0 units</em></h2>
+        <select value={filters.oosFilter} onChange={e => setFilters(f => ({...f, oosFilter: e.target.value}))} 
+          style={{padding: '6px 10px', fontSize: 12, background: 'var(--bg)', border: '1px solid var(--border)', color: 'var(--text)', borderRadius: 2, cursor: 'pointer', marginBottom: 12}}>
+          <option value="">All brands</option>
+          {brands.map(b => <option key={b} value={b}>{b}</option>)}
+        </select>
         <div className="card" style={{padding: 0, overflow: 'hidden'}}>
           {filteredOos.length === 0 ? (
-            <div className="empty-msg">No out-of-stock products</div>
+            <div style={{padding: 20, color: 'var(--text-faint)', textAlign: 'center'}}>No out-of-stock products</div>
           ) : (
             <div style={{overflowX: 'auto'}}>
-              <table className="data-table">
-                <thead><tr><th>SKU</th><th>Product</th><th>Brand</th></tr></thead>
+              <table style={{width: '100%', borderCollapse: 'collapse', fontSize: 12}}>
+                <thead><tr style={{background: 'var(--bg-elev)'}}>
+                  <th style={{textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid var(--border)', fontFamily: 'JetBrains Mono', fontSize: 10, textTransform: 'uppercase', color: 'var(--text-faint)'}}>SKU</th>
+                  <th style={{textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid var(--border)', fontFamily: 'JetBrains Mono', fontSize: 10, textTransform: 'uppercase', color: 'var(--text-faint)'}}>Product</th>
+                  <th style={{textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid var(--border)', fontFamily: 'JetBrains Mono', fontSize: 10, textTransform: 'uppercase', color: 'var(--text-faint)'}}>Brand</th>
+                </tr></thead>
                 <tbody>
                   {filteredOos.map((p, i) => (
-                    <tr key={i}>
-                      <td className="dim" style={{fontFamily: 'JetBrains Mono'}}>{p.sku}</td>
-                      <td>{p.name}</td>
-                      <td className="dim" style={{color: brandColor(p.brand)}}>{p.brand}</td>
+                    <tr key={i} style={{borderBottom: '1px solid var(--border-soft)'}}>
+                      <td style={{padding: '12px 16px', fontFamily: 'JetBrains Mono', color: 'var(--text-dim)'}}>{p.sku}</td>
+                      <td style={{padding: '12px 16px'}}>{p.name}</td>
+                      <td style={{padding: '12px 16px', color: brandColor(p.brand)}}>{p.brand}</td>
                     </tr>
                   ))}
                 </tbody>
