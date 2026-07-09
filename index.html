@@ -15,24 +15,26 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; font-size: 14px; line-height: 1.5; min-height: 100vh; }
 .app { max-width: 1400px; margin: 0 auto; padding: 32px 24px 120px; }
-.debug { background: #fff9f0; border: 2px solid #ff8c00; padding: 16px; margin: 20px 0; border-radius: 4px; font-family: monospace; font-size: 11px; line-height: 1.8; color: #333; max-height: 300px; overflow-y: auto; }
-.debug-title { font-weight: bold; color: #c65911; margin-bottom: 8px; }
 .topbar { display: flex; justify-content: space-between; align-items: center; padding-bottom: 20px; border-bottom: 1px solid var(--border); margin-bottom: 28px; }
 .topbar-title { font-size: 28px; font-weight: 600; }
-.topbar-meta { display: flex; gap: 12px; font-size: 12px; color: var(--text-faint); font-family: 'JetBrains Mono'; }
 .section { margin-bottom: 32px; }
 .section-title { font-size: 20px; font-weight: 500; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
 .card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 24px; }
-.brand-card { border-top: 3px solid; padding: 20px 18px; display: flex; flex-direction: column; gap: 12px; }
-.brand-name { font-size: 16px; font-weight: 500; }
-.metric { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
-.metric-val { color: var(--text); font-family: 'JetBrains Mono'; font-weight: 500; }
-.loading { padding: 60px 20px; text-align: center; color: var(--text-faint); font-size: 16px; }
+.brand-card { border-top: 3px solid; padding: 20px; }
+.metric { font-size: 13px; margin: 12px 0; }
+.table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.table th { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono'; font-size: 10px; text-transform: uppercase; color: var(--text-faint); }
+.table td { padding: 12px 16px; border-bottom: 1px solid var(--border-soft); }
+.loading { padding: 60px 20px; text-align: center; color: var(--text-faint); }
+.error { padding: 20px; background: #fef0f0; border: 2px solid #d9b3b3; border-radius: 4px; color: #8b3333; }
 </style>
 </head>
 <body>
 <div id="root"></div>
-<script type="text/babel">
+
+<script>
+const e = React.createElement;
 const { useState, useEffect, useMemo } = React;
 
 const BRAND_COLORS = { 
@@ -52,93 +54,61 @@ const brandColor = (b) => BRAND_COLORS[b] || '#9dc1a9';
 function App() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
-  const [debug, setDebug] = useState([]);
   const [filters, setFilters] = useState({ oosFilter: '' });
 
-  const addDebug = (msg) => {
-    console.log('[DEBUG]', msg);
-    setDebug(d => [...d, new Date().toLocaleTimeString() + ': ' + msg]);
-  };
-
   useEffect(() => {
-    addDebug('Component mounted, starting fetch...');
+    console.log('[Inventory] Mounting, fetching data...');
     
-    const load = async () => {
-      try {
-        const url = 'sales_data.json.gz?t=' + Date.now();
-        addDebug('Fetching: ' + url);
-        
-        const res = await fetch(url);
-        addDebug('Response status: ' + res.status);
-        
-        if (!res.ok) {
-          throw new Error('HTTP ' + res.status);
-        }
-        
-        const buf = await res.arrayBuffer();
-        addDebug('Got ' + buf.byteLength + ' bytes');
-        
+    fetch('sales_data.json.gz?t=' + Date.now())
+      .then(r => {
+        console.log('[Inventory] Fetch response:', r.status);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.arrayBuffer();
+      })
+      .then(buf => {
+        console.log('[Inventory] Got', buf.byteLength, 'bytes');
         const bytes = new Uint8Array(buf);
-        addDebug('First 2 bytes: 0x' + bytes[0].toString(16) + ' 0x' + bytes[1].toString(16));
-        
         let text;
         if (bytes[0] === 0x1f && bytes[1] === 0x8b) {
-          addDebug('Data is gzipped, decompressing...');
+          console.log('[Inventory] Decompressing gzip...');
           text = pako.ungzip(bytes, { to: 'string' });
-          addDebug('Decompressed to ' + text.length + ' chars');
         } else {
-          addDebug('Data not gzipped, reading as text...');
+          console.log('[Inventory] Reading as plain text...');
           text = new TextDecoder().decode(bytes);
         }
-        
         const obj = JSON.parse(text);
-        addDebug('Parsed JSON. Keys: ' + Object.keys(obj).join(', '));
-        addDebug('Inventory items: ' + (obj.inventory ? obj.inventory.length : 'none'));
-        
+        console.log('[Inventory] Parsed data, keys:', Object.keys(obj));
+        console.log('[Inventory] Inventory items:', obj.inventory ? obj.inventory.length : 0);
         setData(obj);
-        addDebug('Data loaded successfully!');
-      } catch (e) {
-        addDebug('ERROR: ' + e.message);
-        setError(e.message);
-      }
-    };
-    
-    load();
+      })
+      .catch(err => {
+        console.error('[Inventory] Error:', err);
+        setError(err.message);
+      });
   }, []);
 
-  if (error) return (
-    <div className="app">
-      <div style={{padding: '20px', background: '#fef0f0', border: '2px solid #d9b3b3', borderRadius: 4, color: '#8b3333'}}>
-        <strong>Error loading data:</strong> {error}
-        <div style={{marginTop: 12, fontSize: 12, maxHeight: 200, overflow: 'auto', background: '#fff', padding: 10, border: '1px solid #d9b3b3', borderRadius: 2}}>
-          {debug.map((d, i) => <div key={i} style={{fontFamily: 'monospace'}}>{d}</div>)}
-        </div>
-      </div>
-    </div>
-  );
-  
-  if (!data) return (
-    <div className="app">
-      <div className="loading">
-        Loading inventory…
-        <div className="debug">
-          <div className="debug-title">Debug Log:</div>
-          {debug.length === 0 ? 'Waiting for data...' : debug.map((d, i) => <div key={i}>{d}</div>)}
-        </div>
-      </div>
-    </div>
-  );
+  if (error) {
+    return e('div', { className: 'app' }, 
+      e('div', { className: 'error' }, 
+        e('strong', null, 'Error: '), error
+      )
+    );
+  }
 
-  return <InventoryDash data={data} filters={filters} setFilters={setFilters} debug={debug} />;
+  if (!data) {
+    return e('div', { className: 'app' }, 
+      e('div', { className: 'loading' }, 'Loading inventory…')
+    );
+  }
+
+  return e(Dashboard, { data, filters, setFilters });
 }
 
-function InventoryDash({ data, filters, setFilters, debug }) {
-  const upd = (k, v) => setFilters(f => ({...f, [k]: v}));
-
+function Dashboard({ data, filters, setFilters }) {
   const inv = useMemo(() => {
     const inventory = data.inventory || [];
     const byBrand = {};
-    const allOosProds = [];
+    const allOos = [];
 
     inventory.forEach(item => {
       const brand = item.brand || '';
@@ -154,7 +124,7 @@ function InventoryDash({ data, filters, setFilters, debug }) {
         byBrand[brand].skus.add(item.sku);
         if (onHand <= 0) {
           byBrand[brand].oosCount += 1;
-          allOosProds.push({ sku: item.sku, name: item.name, brand });
+          allOos.push({ sku: item.sku, name: item.name, brand });
         }
       }
     });
@@ -168,99 +138,102 @@ function InventoryDash({ data, filters, setFilters, debug }) {
       skus: d.skus.size,
     }));
 
-    return { brands, oosProds: allOosProds };
+    return { brands, oosProds: allOos };
   }, [data]);
 
-  const filteredOos = useMemo(() => {
-    return inv.oosProds.filter(p => !filters.oosFilter || p.brand === filters.oosFilter);
-  }, [inv, filters]);
-
+  const filteredOos = inv.oosProds.filter(p => !filters.oosFilter || p.brand === filters.oosFilter);
   const brands = [...new Set(inv.brands.map(b => b.name))].sort();
   const ago = Math.floor((Date.now() - new Date(data.fetched_at).getTime()) / 60000);
 
-  return (
-    <div className="app">
-      <div className="topbar">
-        <h1 className="topbar-title">Inventory</h1>
-        <div className="topbar-meta">
-          <span><strong>{inv.brands.reduce((s, b) => s + b.skus, 0)}</strong> SKUs</span>
-          <span>·</span>
-          <span>Updated {ago < 1 ? 'now' : ago + 'm ago'}</span>
-        </div>
-      </div>
+  return e('div', { className: 'app' },
+    // Topbar
+    e('div', { className: 'topbar' },
+      e('h1', { className: 'topbar-title' }, 'Inventory'),
+      e('div', null,
+        e('span', null, e('strong', null, inv.brands.reduce((s, b) => s + b.skus, 0)), ' SKUs'),
+        ' · ',
+        e('span', null, 'Updated ', ago < 1 ? 'now' : ago + 'm ago')
+      )
+    ),
 
-      <section className="section">
-        <h2 className="section-title">By <em>brand</em></h2>
-        <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16}}>
-          {inv.brands.map(b => (
-            <div key={b.name} className="card brand-card" style={{borderTopColor: brandColor(b.name)}}>
-              <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'baseline'}}>
-                <div className="brand-name">{b.name}</div>
-                <div style={{fontSize: 12, color: 'var(--text-faint)', fontFamily: 'JetBrains Mono'}}>{b.skus} SKUs</div>
-              </div>
-              <div className="metric">
-                <div style={{display: 'flex', justifyContent: 'space-between'}}>
-                  <span>On hand</span>
-                  <span className="metric-val">{fmtNum(b.onHand)}</span>
-                </div>
-                <div style={{fontSize: 12, color: 'var(--text-faint)', fontFamily: 'JetBrains Mono'}}>{fmtMoney(b.onHand * AVG_UNIT_PRICE)}</div>
-              </div>
-              <div className="metric">
-                <div style={{display: 'flex', justifyContent: 'space-between'}}>
-                  <span>Reserved</span>
-                  <span className="metric-val">{fmtNum(b.reserved)}</span>
-                </div>
-                <div style={{fontSize: 12, color: 'var(--text-faint)', fontFamily: 'JetBrains Mono'}}>{fmtMoney(b.reserved * AVG_UNIT_PRICE)}</div>
-              </div>
-              <div className="metric">
-                <div style={{display: 'flex', justifyContent: 'space-between'}}>
-                  <span>Available</span>
-                  <span className="metric-val" style={{color: 'var(--accent)'}}>{fmtNum(b.available)}</span>
-                </div>
-                <div style={{fontSize: 12, color: 'var(--text-faint)', fontFamily: 'JetBrains Mono'}}>{fmtMoney(b.available * AVG_UNIT_PRICE)}</div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
+    // Brand cards
+    e('section', { className: 'section' },
+      e('h2', { className: 'section-title' }, 'By ', e('em', null, 'brand')),
+      e('div', { className: 'grid' },
+        inv.brands.map(b =>
+          e('div', { key: b.name, className: 'card brand-card', style: { borderTopColor: brandColor(b.name) } },
+            e('div', { style: { display: 'flex', justifyContent: 'space-between' } },
+              e('div', { style: { fontSize: 16, fontWeight: 500 } }, b.name),
+              e('div', { style: { fontSize: 12, color: 'var(--text-faint)', fontFamily: 'JetBrains Mono' } }, b.skus + ' SKUs')
+            ),
+            e('div', { className: 'metric' },
+              e('div', { style: { display: 'flex', justifyContent: 'space-between' } },
+                e('span', null, 'On hand'),
+                e('span', { style: { fontFamily: 'JetBrains Mono', fontWeight: 500 } }, fmtNum(b.onHand))
+              ),
+              e('div', { style: { fontSize: 12, color: 'var(--text-faint)', fontFamily: 'JetBrains Mono' } }, fmtMoney(b.onHand * AVG_UNIT_PRICE))
+            ),
+            e('div', { className: 'metric' },
+              e('div', { style: { display: 'flex', justifyContent: 'space-between' } },
+                e('span', null, 'Reserved'),
+                e('span', { style: { fontFamily: 'JetBrains Mono', fontWeight: 500 } }, fmtNum(b.reserved))
+              ),
+              e('div', { style: { fontSize: 12, color: 'var(--text-faint)', fontFamily: 'JetBrains Mono' } }, fmtMoney(b.reserved * AVG_UNIT_PRICE))
+            ),
+            e('div', { className: 'metric' },
+              e('div', { style: { display: 'flex', justifyContent: 'space-between' } },
+                e('span', null, 'Available'),
+                e('span', { style: { fontFamily: 'JetBrains Mono', fontWeight: 500, color: 'var(--accent)' } }, fmtNum(b.available))
+              ),
+              e('div', { style: { fontSize: 12, color: 'var(--text-faint)', fontFamily: 'JetBrains Mono' } }, fmtMoney(b.available * AVG_UNIT_PRICE))
+            )
+          )
+        )
+      )
+    ),
 
-      <section className="section">
-        <h2 className="section-title">Out of Stock <em>· 0 units</em></h2>
-        <select value={filters.oosFilter} onChange={e => setFilters(f => ({...f, oosFilter: e.target.value}))} 
-          style={{padding: '6px 10px', fontSize: 12, background: 'var(--bg)', border: '1px solid var(--border)', color: 'var(--text)', borderRadius: 2, cursor: 'pointer', marginBottom: 12}}>
-          <option value="">All brands</option>
-          {brands.map(b => <option key={b} value={b}>{b}</option>)}
-        </select>
-        <div className="card" style={{padding: 0, overflow: 'hidden'}}>
-          {filteredOos.length === 0 ? (
-            <div style={{padding: 20, color: 'var(--text-faint)', textAlign: 'center'}}>No out-of-stock products</div>
-          ) : (
-            <div style={{overflowX: 'auto'}}>
-              <table style={{width: '100%', borderCollapse: 'collapse', fontSize: 12}}>
-                <thead><tr style={{background: 'var(--bg-elev)'}}>
-                  <th style={{textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid var(--border)', fontFamily: 'JetBrains Mono', fontSize: 10, textTransform: 'uppercase', color: 'var(--text-faint)'}}>SKU</th>
-                  <th style={{textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid var(--border)', fontFamily: 'JetBrains Mono', fontSize: 10, textTransform: 'uppercase', color: 'var(--text-faint)'}}>Product</th>
-                  <th style={{textAlign: 'left', padding: '12px 16px', borderBottom: '1px solid var(--border)', fontFamily: 'JetBrains Mono', fontSize: 10, textTransform: 'uppercase', color: 'var(--text-faint)'}}>Brand</th>
-                </tr></thead>
-                <tbody>
-                  {filteredOos.map((p, i) => (
-                    <tr key={i} style={{borderBottom: '1px solid var(--border-soft)'}}>
-                      <td style={{padding: '12px 16px', fontFamily: 'JetBrains Mono', color: 'var(--text-dim)'}}>{p.sku}</td>
-                      <td style={{padding: '12px 16px'}}>{p.name}</td>
-                      <td style={{padding: '12px 16px', color: brandColor(p.brand)}}>{p.brand}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </section>
-    </div>
+    // Out of stock
+    e('section', { className: 'section' },
+      e('h2', { className: 'section-title' }, 'Out of Stock'),
+      e('select', {
+        value: filters.oosFilter,
+        onChange: (ev) => setFilters(f => ({ ...f, oosFilter: ev.target.value })),
+        style: { padding: '6px 10px', fontSize: 12, background: 'var(--bg)', border: '1px solid var(--border)', color: 'var(--text)', borderRadius: 2, cursor: 'pointer', marginBottom: 12 }
+      },
+        e('option', { value: '' }, 'All brands'),
+        brands.map(b => e('option', { key: b, value: b }, b))
+      ),
+      e('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+        filteredOos.length === 0
+          ? e('div', { style: { padding: 20, color: 'var(--text-faint)', textAlign: 'center' } }, 'No out-of-stock products')
+          : e('table', { className: 'table' },
+              e('thead', null,
+                e('tr', null,
+                  e('th', null, 'SKU'),
+                  e('th', null, 'Product'),
+                  e('th', null, 'Brand')
+                )
+              ),
+              e('tbody', null,
+                filteredOos.map((p, i) =>
+                  e('tr', { key: i },
+                    e('td', { style: { fontFamily: 'JetBrains Mono', color: 'var(--text-dim)' } }, p.sku),
+                    e('td', null, p.name),
+                    e('td', { style: { color: brandColor(p.brand) } }, p.brand)
+                  )
+                )
+              )
+            )
+      )
+    )
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+// Mount
+setTimeout(() => {
+  console.log('[Inventory] Rendering to root...');
+  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+}, 0);
 </script>
 </body>
 </html>
