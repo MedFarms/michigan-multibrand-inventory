@@ -1282,8 +1282,16 @@ const NAV = [{
   href: 'https://maeann-png.github.io/michigan-multibrand-rep/'
 }];
 const ACTIVE = 'inventory';
-// Estimated average unit price from sales data (inventory has no price field; used for $ value estimation)
-const AVG_UNIT_PRICE = 56.05;
+
+// Inventory rows carry no price. Dollar values are derived per-SKU from the
+// sales rows in the same payload — see `pricing` in InventoryDashboard.
+//
+// The old blanket `AVG_UNIT_PRICE = 56.05` overstated on-hand value by ~6.9x
+// ($23.2M vs $3.38M). It conflated two different units: inventory counts are
+// individual units ("eaches"), but $56.05 was closer to a per-CASE figure.
+// In the sales rows: quantity = units_sold x unit_multiplier, so `quantity` is
+// eaches and `units_sold` is cases. Inventory `inventory` matches the eaches
+// basis, so $/unit must be revenue / quantity.
 
 // Covert Cups' electric yellow (#eaf031) is unreadable on the light lavender
 // theme. Darken it here only — the Sales / AR / Rep dashboards still use the
@@ -1307,8 +1315,7 @@ function App() {
   const [filters, setFilters] = useState({
     brand: '',
     status: '',
-    search: '',
-    stock: ''
+    search: ''
   });
   if (error) return /*#__PURE__*/React.createElement("div", {
     className: "app"
@@ -1336,26 +1343,79 @@ function InventoryDashboard({
   setFilters
 }) {
   const [invMetric, setInvMetric] = useState('onhand');
-  // Independent brand narrowing for the Out-of-stock table only.
+  // Independent brand narrowing, scoped to a single table each.
+  const [prodBrand, setProdBrand] = useState('');
   const [oosBrand, setOosBrand] = useState('');
   const raw = data.inventory || [];
   const asOf = useMemo(() => data.fetched_at ? new Date(data.fetched_at) : new Date(), [data]);
+
+  // Real $/unit per SKU, from actual sales: revenue / quantity (quantity = eaches).
+  // Samples are excluded so $0 giveaways don't drag the average down.
+  // Fallback chain: SKU price -> that brand's average -> overall average.
+  // Averages are computed only over SKUs we actually stock, so unrelated
+  // third-party brands in `rows` can't skew the fallback.
+  const pricing = useMemo(() => {
+    const brandOf = {};
+    raw.forEach(i => {
+      if (i.sku) brandOf[i.sku] = i.brand || '—';
+    });
+    const rev = {},
+      qty = {},
+      bRev = {},
+      bQty = {};
+    let gRev = 0,
+      gQty = 0;
+    (data.rows || []).forEach(r => {
+      if (r.is_sample) return;
+      const s = r.product_sku;
+      if (!s || !(s in brandOf)) return;
+      const rv = +r.revenue || 0;
+      const q = +r.quantity || 0;
+      if (q <= 0) return;
+      rev[s] = (rev[s] || 0) + rv;
+      qty[s] = (qty[s] || 0) + q;
+      const b = brandOf[s];
+      bRev[b] = (bRev[b] || 0) + rv;
+      bQty[b] = (bQty[b] || 0) + q;
+      gRev += rv;
+      gQty += q;
+    });
+    const bySku = {};
+    Object.keys(rev).forEach(s => {
+      if (qty[s] > 0) bySku[s] = rev[s] / qty[s];
+    });
+    const byBrand = {};
+    Object.keys(bRev).forEach(b => {
+      if (bQty[b] > 0) byBrand[b] = bRev[b] / bQty[b];
+    });
+    return {
+      bySku,
+      byBrand,
+      global: gQty > 0 ? gRev / gQty : 0
+    };
+  }, [raw, data]);
   const items = useMemo(() => raw.map(p => {
     const onHand = +p.inventory || 0;
     const reserved = +p.reserved || 0;
     const available = p.available != null ? +p.available || 0 : p.avail != null ? +p.avail || 0 : onHand - reserved;
+    const brand = p.brand || '—';
+    const price = pricing.bySku[p.sku] != null ? pricing.bySku[p.sku] : pricing.byBrand[brand] != null ? pricing.byBrand[brand] : pricing.global;
     return {
       id: p.id,
       sku: p.sku,
       name: p.name || '—',
       line: p.line || '—',
       status: p.status || '—',
-      brand: p.brand || '—',
+      brand,
       onHand,
       reserved,
-      available
+      available,
+      price,
+      onHandValue: onHand * price,
+      reservedValue: reserved * price,
+      availableValue: available * price
     };
-  }), [raw]);
+  }), [raw, pricing]);
   const distinct = useMemo(() => ({
     brands: PRIMARY_BRANDS.filter(b => items.some(p => p.brand === b)),
     statuses: [...new Set(items.map(p => p.status).filter(Boolean))].sort()
@@ -1365,8 +1425,6 @@ function InventoryDashboard({
     if (filters.status === 'Reserved') {
       if (p.reserved <= 0) return false;
     } else if (filters.status && p.status !== filters.status) return false;
-    if (filters.stock === 'in' && p.onHand <= 0) return false;
-    if (filters.stock === 'out' && p.onHand > 0) return false;
     if (filters.search) {
       const q = filters.search.toLowerCase();
       if (!(p.name + ' ' + p.sku + ' ' + p.brand).toLowerCase().includes(q)) return false;
@@ -1377,11 +1435,17 @@ function InventoryDashboard({
     const onHand = filtered.reduce((s, p) => s + p.onHand, 0);
     const reserved = filtered.reduce((s, p) => s + p.reserved, 0);
     const available = filtered.reduce((s, p) => s + p.available, 0);
+    const onHandValue = filtered.reduce((s, p) => s + p.onHandValue, 0);
+    const reservedValue = filtered.reduce((s, p) => s + p.reservedValue, 0);
+    const availableValue = filtered.reduce((s, p) => s + p.availableValue, 0);
     const oos = filtered.filter(p => p.onHand <= 0).length;
     return {
       onHand,
       reserved,
       available,
+      onHandValue,
+      reservedValue,
+      availableValue,
       oos,
       skus: filtered.length
     };
@@ -1413,12 +1477,18 @@ function InventoryDashboard({
         onHand: 0,
         reserved: 0,
         available: 0,
-        skus: 0
+        skus: 0,
+        onHandValue: 0,
+        reservedValue: 0,
+        availableValue: 0
       };
       m[p.brand].onHand += p.onHand;
       m[p.brand].reserved += p.reserved;
       m[p.brand].available += p.available;
       m[p.brand].skus += 1;
+      m[p.brand].onHandValue += p.onHandValue;
+      m[p.brand].reservedValue += p.reservedValue;
+      m[p.brand].availableValue += p.availableValue;
     });
     return Object.values(m).sort((a, b) => b.onHand - a.onHand);
   }, [filtered]);
@@ -1426,9 +1496,9 @@ function InventoryDashboard({
     setFilters({
       brand: '',
       status: '',
-      search: '',
-      stock: ''
+      search: ''
     });
+    setProdBrand('');
     setOosBrand('');
   };
   const upd = (k, v) => setFilters(f => ({
@@ -1470,20 +1540,6 @@ function InventoryDashboard({
   }), /*#__PURE__*/React.createElement("div", {
     className: "filters"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "filter-group"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "filter-label"
-  }, "Stock"), /*#__PURE__*/React.createElement("select", {
-    className: "filter-select",
-    value: filters.stock,
-    onChange: e => upd('stock', e.target.value)
-  }, /*#__PURE__*/React.createElement("option", {
-    value: ""
-  }, "All"), /*#__PURE__*/React.createElement("option", {
-    value: "in"
-  }, "In stock"), /*#__PURE__*/React.createElement("option", {
-    value: "out"
-  }, "Out of stock"))), /*#__PURE__*/React.createElement("div", {
     className: "filter-group",
     style: {
       minWidth: 220
@@ -1504,16 +1560,16 @@ function InventoryDashboard({
   }, /*#__PURE__*/React.createElement(Kpi, {
     label: "Units On Hand",
     value: fmtNum(kpis.onHand),
-    sub: fmtNum(kpis.skus) + ' SKUs · ' + fmtMoney(kpis.onHand * AVG_UNIT_PRICE),
+    sub: fmtNum(kpis.skus) + ' SKUs · ' + fmtMoney(kpis.onHandValue),
     accent: true
   }), /*#__PURE__*/React.createElement(Kpi, {
     label: "Reserved",
     value: fmtNum(kpis.reserved),
-    sub: 'committed to orders · ' + fmtMoney(kpis.reserved * AVG_UNIT_PRICE)
+    sub: 'committed to orders · ' + fmtMoney(kpis.reservedValue)
   }), /*#__PURE__*/React.createElement(Kpi, {
     label: "Available",
     value: fmtNum(kpis.available),
-    sub: 'on hand − reserved · ' + fmtMoney(kpis.available * AVG_UNIT_PRICE)
+    sub: 'on hand − reserved · ' + fmtMoney(kpis.availableValue)
   }), /*#__PURE__*/React.createElement(Kpi, {
     label: "Out of Stock",
     value: fmtNum(kpis.oos),
@@ -1678,7 +1734,7 @@ function InventoryDashboard({
       display: 'block',
       fontSize: 10
     }
-  }, fmtMoney(b.onHand * AVG_UNIT_PRICE)))), /*#__PURE__*/React.createElement("div", {
+  }, fmtMoney(b.onHandValue)))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       justifyContent: 'space-between',
@@ -1702,7 +1758,7 @@ function InventoryDashboard({
       display: 'block',
       fontSize: 10
     }
-  }, fmtMoney(b.reserved * AVG_UNIT_PRICE)))), /*#__PURE__*/React.createElement("div", {
+  }, fmtMoney(b.reservedValue)))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       justifyContent: 'space-between',
@@ -1728,16 +1784,37 @@ function InventoryDashboard({
       display: 'block',
       fontSize: 10
     }
-  }, fmtMoney(b.available * AVG_UNIT_PRICE)))))))), (() => {
+  }, fmtMoney(b.availableValue)))))))), (() => {
     const mk = invMetric === 'reserved' ? 'reserved' : invMetric === 'available' ? 'available' : 'onHand';
-    const tableRows = filtered.filter(p => invMetric === 'onhand' ? true : p[mk] > 0).slice().sort((a, b) => b[mk] - a[mk]);
+    // Out-of-stock SKUs are excluded here — they get their own table below.
+    const tableRows = filtered.filter(p => p.onHand > 0).filter(p => !prodBrand || p.brand === prodBrand).filter(p => invMetric === 'onhand' ? true : p[mk] > 0).slice().sort((a, b) => b[mk] - a[mk]);
     return /*#__PURE__*/React.createElement("section", {
       className: "section"
-    }, /*#__PURE__*/React.createElement(SectionHeader, {
-      title: "Product",
-      em: "inventory",
-      meta: fmtNum(tableRows.length) + ' SKUs' + (invMetric !== 'onhand' ? ' \u00b7 ' + (invMetric === 'reserved' ? 'reserved' : 'available') : '')
-    }), /*#__PURE__*/React.createElement("div", {
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "section-header"
+    }, /*#__PURE__*/React.createElement("h2", {
+      className: "section-title"
+    }, "Product ", /*#__PURE__*/React.createElement("em", null, "inventory")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "section-meta"
+    }, fmtNum(tableRows.length), " SKUs in stock", invMetric !== 'onhand' ? ' \u00b7 ' + (invMetric === 'reserved' ? 'reserved' : 'available') : ''), /*#__PURE__*/React.createElement("select", {
+      className: "filter-select",
+      style: {
+        minWidth: 150
+      },
+      value: prodBrand,
+      onChange: e => setProdBrand(e.target.value)
+    }, /*#__PURE__*/React.createElement("option", {
+      value: ""
+    }, "All brands"), distinct.brands.map(b => /*#__PURE__*/React.createElement("option", {
+      key: b,
+      value: b
+    }, brandLabel(b)))))), /*#__PURE__*/React.createElement("div", {
       className: "card",
       style: {
         padding: 0,
