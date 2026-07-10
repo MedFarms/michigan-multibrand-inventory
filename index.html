@@ -1438,7 +1438,7 @@ function InventoryDashboard({
     const onHandValue = filtered.reduce((s, p) => s + p.onHandValue, 0);
     const reservedValue = filtered.reduce((s, p) => s + p.reservedValue, 0);
     const availableValue = filtered.reduce((s, p) => s + p.availableValue, 0);
-    const oos = filtered.filter(p => p.onHand <= 0).length;
+    const oos = filtered.filter(p => p.available <= 0).length;
     return {
       onHand,
       reserved,
@@ -1453,7 +1453,7 @@ function InventoryDashboard({
 
   // Out-of-stock products (zero on hand) — respects brand + search, ignores the stock dropdown
   const oosItems = useMemo(() => items.filter(p => {
-    if (p.onHand > 0) return false;
+    if (p.available > 0) return false;
     if (filters.brand && p.brand !== filters.brand) return false;
     if (oosBrand && p.brand !== oosBrand) return false;
     if (filters.search) {
@@ -1466,7 +1466,7 @@ function InventoryDashboard({
   // Brands that actually have something out of stock — no point offering
   // a dropdown option that always yields an empty table.
   const oosBrands = useMemo(() => {
-    const s = new Set(items.filter(p => p.onHand <= 0).map(p => p.brand));
+    const s = new Set(items.filter(p => p.available <= 0).map(p => p.brand));
     return PRIMARY_BRANDS.filter(b => s.has(b));
   }, [items]);
   const byBrand = useMemo(() => {
@@ -1573,7 +1573,7 @@ function InventoryDashboard({
   }), /*#__PURE__*/React.createElement(Kpi, {
     label: "Out of Stock",
     value: fmtNum(kpis.oos),
-    sub: "SKUs with 0 on hand",
+    sub: "SKUs · 0 available",
     color: kpis.oos ? 'var(--rose)' : null
   })), /*#__PURE__*/React.createElement("section", {
     className: "section"
@@ -1786,8 +1786,10 @@ function InventoryDashboard({
     }
   }, fmtMoney(b.availableValue)))))))), (() => {
     const mk = invMetric === 'reserved' ? 'reserved' : invMetric === 'available' ? 'available' : 'onHand';
-    // Out-of-stock SKUs are excluded here — they get their own table below.
-    const tableRows = filtered.filter(p => p.onHand > 0).filter(p => !prodBrand || p.brand === prodBrand).filter(p => invMetric === 'onhand' ? true : p[mk] > 0).slice().sort((a, b) => b[mk] - a[mk]);
+    // "In stock" = something a buyer can actually order (available > 0).
+    // Sold-through SKUs (units on hand but all reserved) are excluded here
+    // and surface in the Out-of-stock table below, so the two never overlap.
+    const tableRows = filtered.filter(p => p.available > 0).filter(p => !prodBrand || p.brand === prodBrand).filter(p => invMetric === 'onhand' ? true : p[mk] > 0).slice().sort((a, b) => b[mk] - a[mk]);
     return /*#__PURE__*/React.createElement("section", {
       className: "section"
     }, /*#__PURE__*/React.createElement("div", {
@@ -1873,7 +1875,7 @@ function InventoryDashboard({
     }
   }, /*#__PURE__*/React.createElement("span", {
     className: "section-meta"
-  }, fmtNum(oosItems.length), " SKUs with 0 on hand"), /*#__PURE__*/React.createElement("select", {
+  }, fmtNum(oosItems.length), " SKUs · 0 available to order"), /*#__PURE__*/React.createElement("select", {
     className: "filter-select",
     style: {
       minWidth: 150
@@ -1918,22 +1920,22 @@ function InventoryDashboard({
   }, p.sku), /*#__PURE__*/React.createElement("td", {
     className: "dim"
   }, p.status), /*#__PURE__*/React.createElement("td", {
+    className: "num"
+  }, /*#__PURE__*/React.createElement("strong", null, fmtNum(p.onHand))), /*#__PURE__*/React.createElement("td", {
+    className: "num dim"
+  }, fmtNum(p.reserved)), /*#__PURE__*/React.createElement("td", {
     className: "num",
     style: {
       color: 'var(--rose)'
     }
-  }, /*#__PURE__*/React.createElement("strong", null, fmtNum(p.onHand))), /*#__PURE__*/React.createElement("td", {
-    className: "num dim"
-  }, fmtNum(p.reserved)), /*#__PURE__*/React.createElement("td", {
-    className: "num"
-  }, fmtNum(p.available)))), oosItems.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+  }, /*#__PURE__*/React.createElement("strong", null, fmtNum(p.available))))), oosItems.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
     colSpan: "7",
     style: {
       textAlign: 'center',
       padding: '28px',
       color: 'var(--text-faint)'
     }
-  }, "Nothing out of stock — every SKU has units on hand"))))))), /*#__PURE__*/React.createElement(StickyFooter, {
+  }, "Nothing out of stock — every SKU has units available to order"))))))), /*#__PURE__*/React.createElement(StickyFooter, {
     nav: NAV,
     active: ACTIVE,
     brands: distinct.brands,
