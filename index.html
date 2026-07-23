@@ -722,7 +722,7 @@ function useData(file) {
   const [error, setError] = useState(null);
   useEffect(() => {
     const load = () => {
-      fetch((file || 'sales_data.json.gz') + '?t=' + Date.now()).then(r => {
+      fetch('https://raw.githubusercontent.com/MedFarms/michigan-multibrand-inventory/refs/heads/main/' + (file || 'sales_data.json.gz') + '?t=' + Date.now()).then(r => {
         if (!r.ok) throw new Error('Could not load ' + (file || 'sales_data.json.gz') + ' (HTTP ' + r.status + ')');
         return r.arrayBuffer();
       }).then(buf => {
