@@ -383,6 +383,11 @@
 
 /* --- order-form grouping rows in the inventory table --- */
 .chip { white-space: nowrap; }
+/* Non-"Available" listing states (e.g. Backorder) still carry stock, so they sit
+   in the same table - this tag is what tells them apart. */
+.state-tag { display:inline-block; margin-left:8px; padding:1px 6px; border-radius:4px; vertical-align:middle;
+  background:var(--accent-deep); color:var(--text-on-bg); font-family:'JetBrains Mono',monospace;
+  font-size:9px; text-transform:uppercase; letter-spacing:.07em; white-space:nowrap; }
 .grp-brand td { background:var(--bg-elev-2); border-top:2px solid var(--border); padding-top:11px; padding-bottom:9px; }
 .grp-line td { background:var(--bg-elev); font-family:'JetBrains Mono',monospace; font-size:10px; text-transform:uppercase;
   letter-spacing:.09em; color:var(--text-dim); padding-top:9px; padding-bottom:5px; }
@@ -1670,14 +1675,22 @@ function InventoryDashboard({
     const brand = p.brand || '—';
     const price = pricing.bySku[p.sku] != null ? pricing.bySku[p.sku] : pricing.byBrand[brand] != null ? pricing.byBrand[brand] : pricing.global;
     const ci = caseInfo[p.sku] || {};
-    const per = ci.unitsPerCase || 0;
-    const casePrice = ci.casePrice || 0;
+    // The inventory feed wins when it carries case config and a product line
+    // (the LeafLink CSV export path supplies both). The order-history
+    // derivation is only a fallback: it reads the last sale, so a discounted
+    // or sample line can put the case price below list.
+    const per = +p.units_per_case || ci.unitsPerCase || 0;
+    const casePrice = +p.case_price || ci.casePrice || 0;
+    const listed = String(p.status || '').trim();
     return {
       id: p.id,
       sku: p.sku,
       name: p.name || '—',
-      line: ci.line || p.line || 'Unassigned',
-      status: p.status || '—',
+      line: String(p.line || '').trim() || ci.line || 'Unassigned',
+      status: listed || '—',
+      listed,
+      // Anything not plainly "Available" gets flagged in the table.
+      offMarket: !!listed && listed.toLowerCase() !== 'available',
       brand,
       unitsPerCase: per,
       casePrice,
@@ -2120,7 +2133,10 @@ function InventoryDashboard({
       const per = p.unitsPerCase;
       body.push(/*#__PURE__*/React.createElement("tr", {
         key: 'p' + i
-      }, /*#__PURE__*/React.createElement("td", null, p.name), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+      }, /*#__PURE__*/React.createElement("td", null, p.name, p.offMarket && /*#__PURE__*/React.createElement("span", {
+        className: "state-tag",
+        title: "Listing state: " + p.status
+      }, p.status)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
         style: brandTag(p.brand)
       }, brandLabel(p.brand))), /*#__PURE__*/React.createElement("td", {
         className: "dim"
@@ -2285,7 +2301,10 @@ function InventoryDashboard({
       const per = p.unitsPerCase;
       out.push(/*#__PURE__*/React.createElement("tr", {
         key: 'p' + i
-      }, /*#__PURE__*/React.createElement("td", null, p.name), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+      }, /*#__PURE__*/React.createElement("td", null, p.name, p.offMarket && /*#__PURE__*/React.createElement("span", {
+        className: "state-tag",
+        title: "Listing state: " + p.status
+      }, p.status)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
         style: brandTag(p.brand)
       }, brandLabel(p.brand))), /*#__PURE__*/React.createElement("td", {
         className: "dim"
