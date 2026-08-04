@@ -382,6 +382,7 @@
 .sb-caret { flex:none; padding:0 4px; color:var(--text-dim); font-size:11px; pointer-events:none; }
 
 /* --- order-form grouping rows in the inventory table --- */
+.chip { white-space: nowrap; }
 .grp-brand td { background:var(--bg-elev-2); border-top:2px solid var(--border); padding-top:11px; padding-bottom:9px; }
 .grp-line td { background:var(--bg-elev); font-family:'JetBrains Mono',monospace; font-size:10px; text-transform:uppercase;
   letter-spacing:.09em; color:var(--text-dim); padding-top:9px; padding-bottom:5px; }
@@ -753,6 +754,22 @@ function SearchBox(props) {
 // Inline (non-chip) brand name labels. Same rule as brandChip: Covert Cups =
 // electric yellow on solid black, Value Pak = white on solid black. Every other
 // brand keeps its plain brand-colored text.
+// Brand color used as *text* on the light cards. The paler brand hues (Covert
+// Cups electric yellow, Value Pak white) disappear against the lavender card,
+// so anything above a readable luminance gets a darkened version instead.
+const brandInk = b => {
+  const c = brandColor(b);
+  const m = /^#([0-9a-fA-F]{6})$/.exec(c);
+  if (!m) return c;
+  const n = parseInt(m[1], 16);
+  const r = n >> 16 & 255,
+    g = n >> 8 & 255,
+    bl = n & 255;
+  if (0.299 * r + 0.587 * g + 0.114 * bl < 165) return c;
+  const h = v => Math.round(v * 0.45).toString(16).padStart(2, '0');
+  return '#' + h(r) + h(g) + h(bl);
+};
+
 const brandTag = b => {
   const s = brandChip(b);
   return s.background ? { color: s.color, background: '#000', padding: '1px 6px', borderRadius: 4 } : { color: s.color };
@@ -1979,7 +1996,9 @@ function InventoryDashboard({
     }
   }, /*#__PURE__*/React.createElement("span", {
     style: Object.assign({
-      fontWeight: 600
+      fontWeight: 600,
+      fontSize: 12,
+      whiteSpace: 'nowrap'
     }, brandTag(b.name))
   }, brandLabel(b.name)), /*#__PURE__*/React.createElement("span", {
     className: "kpi-sub"
@@ -1999,7 +2018,8 @@ function InventoryDashboard({
   }, /*#__PURE__*/React.createElement("span", {
     className: "font-mono",
     style: {
-      fontWeight: 600
+      fontWeight: 600,
+      color: 'var(--text)'
     }
   }, fmtNum(b.onHand)), /*#__PURE__*/React.createElement("span", {
     className: "kpi-sub font-mono",
@@ -2049,7 +2069,7 @@ function InventoryDashboard({
     className: "font-mono",
     style: {
       fontWeight: 600,
-      color: brandColor(b.name)
+      color: brandInk(b.name)
     }
   }, fmtNum(b.available)), /*#__PURE__*/React.createElement("span", {
     className: "kpi-sub font-mono",
