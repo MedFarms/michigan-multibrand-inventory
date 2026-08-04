@@ -2,8 +2,17 @@ name: Scrape LeafLink Sales (All Brands)
 
 on:
   workflow_dispatch:
+    inputs:
+      incremental_days:
+        description: "Days to pull (0 = full backfill from LEAFLINK_FROM_DATE)"
+        required: false
+        default: '7'
   push:
     branches: [main]
+  schedule:
+    # Weekly full refresh, so backdated or amended orders outside the
+    # incremental window still get corrected. Sundays 09:00 UTC.
+    - cron: '0 9 * * 0'
 
 permissions:
   contents: write
@@ -35,6 +44,12 @@ jobs:
           LEAFLINK_FROM_DATE: '2020-01-01'
           LEAFLINK_EXCLUDE_STATUSES: 'Cancelled,Rejected'
           LEAFLINK_PULL_INVENTORY: '1'
+          # Incremental mode: pull only the last N days and merge into the
+          # committed file instead of rescanning 2020->today on every run. The
+          # scraper still does a full backfill on the first run, or any run where
+          # the committed data isn't yet complete back to LEAFLINK_FROM_DATE.
+          # Set to '0' (or run the Full refresh workflow) to force a full pull.
+          LEAFLINK_INCREMENTAL_DAYS: ${{ github.event_name == 'schedule' && '0' || (github.event.inputs.incremental_days || '7') }}
         run: python scraper.py
 
       - name: Commit updated data
