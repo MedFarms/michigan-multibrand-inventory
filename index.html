@@ -380,6 +380,11 @@
   font-family:'JetBrains Mono',monospace; font-size:9px; text-transform:uppercase; letter-spacing:.08em; }
 .sb-clear:hover { color:var(--accent); }
 .sb-caret { flex:none; padding:0 4px; color:var(--text-dim); font-size:11px; pointer-events:none; }
+
+/* --- order-form grouping rows in the inventory table --- */
+.grp-brand td { background:var(--bg-elev-2); border-top:2px solid var(--border); padding-top:11px; padding-bottom:9px; }
+.grp-line td { background:var(--bg-elev); font-family:'JetBrains Mono',monospace; font-size:10px; text-transform:uppercase;
+  letter-spacing:.09em; color:var(--text-dim); padding-top:9px; padding-bottom:5px; }
 .sb-drop { position:absolute; z-index:140; top:calc(100% + 5px); left:0; right:0; min-width:240px;
   max-height:270px; overflow-y:auto; background:var(--bg-elev); border:1px solid var(--border);
   border-radius:var(--radius-sm); box-shadow:0 14px 34px -12px rgba(0,0,0,.55); }
@@ -1608,19 +1613,60 @@ function InventoryDashboard({
       global: gQty > 0 ? gRev / gQty : 0
     };
   }, [raw, data]);
+
+  // Case configuration + product line per SKU. The inventory feed doesn't carry
+  // any of this, but the order lines do: unit_multiplier = units per case,
+  // unit_price = wholesale price for that case, product_line = the grouping used
+  // on the allocation sheet. Case packs get re-cut over time, so take the most
+  // recent order line for each SKU rather than the first.
+  const caseInfo = useMemo(() => {
+    const have = {};
+    raw.forEach(i => {
+      if (i.sku) have[i.sku] = 1;
+    });
+    const packs = {},
+      lines = {};
+    (data.rows || []).forEach(r => {
+      const s = r.product_sku;
+      if (!s || !have[s]) return;
+      const d = r.order_date || '';
+      const per = +r.unit_multiplier || 0;
+      if (per > 0 && (!packs[s] || d >= packs[s].d)) packs[s] = { d: d, per: per, casePrice: +r.unit_price || 0 };
+      const ln = String(r.product_line || '').trim();
+      if (ln && (!lines[s] || d >= lines[s].d)) lines[s] = { d: d, ln: ln };
+    });
+    const out = {};
+    Object.keys(have).forEach(s => {
+      const pk = packs[s];
+      out[s] = {
+        line: lines[s] ? lines[s].ln : '',
+        unitsPerCase: pk ? pk.per : 0,
+        casePrice: pk ? pk.casePrice : 0
+      };
+    });
+    return out;
+  }, [raw, data]);
   const items = useMemo(() => raw.map(p => {
     const onHand = +p.inventory || 0;
     const reserved = +p.reserved || 0;
     const available = p.available != null ? +p.available || 0 : p.avail != null ? +p.avail || 0 : onHand - reserved;
     const brand = p.brand || '—';
     const price = pricing.bySku[p.sku] != null ? pricing.bySku[p.sku] : pricing.byBrand[brand] != null ? pricing.byBrand[brand] : pricing.global;
+    const ci = caseInfo[p.sku] || {};
+    const per = ci.unitsPerCase || 0;
+    const casePrice = ci.casePrice || 0;
     return {
       id: p.id,
       sku: p.sku,
       name: p.name || '—',
-      line: p.line || '—',
+      line: ci.line || p.line || 'Unassigned',
       status: p.status || '—',
       brand,
+      unitsPerCase: per,
+      casePrice,
+      unitPrice: per > 0 ? casePrice / per : 0,
+      availCasesExact: per > 0 ? available / per : 0,
+      availCasesFull: per > 0 ? Math.floor(available / per) : 0,
       onHand,
       reserved,
       available,
@@ -1629,7 +1675,7 @@ function InventoryDashboard({
       reservedValue: reserved * price,
       availableValue: available * price
     };
-  }), [raw, pricing]);
+  }), [raw, pricing, caseInfo]);
   const distinct = useMemo(() => ({
     brands: PRIMARY_BRANDS.filter(b => items.some(p => p.brand === b)),
     statuses: [...new Set(items.map(p => p.status).filter(Boolean))].sort()
@@ -1689,7 +1735,7 @@ function InventoryDashboard({
     if (oosBrand && p.brand !== oosBrand) return false;
     if (!matchesSearch(filters.search, p.name + ' ' + p.sku + ' ' + p.brand)) return false;
     return true;
-  }).sort((a, b) => (a.name || '').localeCompare(b.name || '')), [items, filters.brand, filters.search, oosBrand]);
+  }).sort((a, b) => brandLabel(a.brand).localeCompare(brandLabel(b.brand)) || a.line.localeCompare(b.line) || a.name.localeCompare(b.name)), [items, filters.brand, filters.search, oosBrand]);
 
   // Brands that actually have something out of stock — no point offering
   // a dropdown option that always yields an empty table.
@@ -2016,7 +2062,62 @@ function InventoryDashboard({
     // "In stock" = something a buyer can actually order (available > 0).
     // Sold-through SKUs (units on hand but all reserved) are excluded here
     // and surface in the Out-of-stock table below, so the two never overlap.
-    const tableRows = filtered.filter(p => p.available > 0).filter(p => !prodBrand || p.brand === prodBrand).filter(p => invMetric === 'onhand' ? true : p[mk] > 0).slice().sort((a, b) => b[mk] - a[mk]);
+    const tableRows = filtered.filter(p => p.available > 0).filter(p => !prodBrand || p.brand === prodBrand).filter(p => invMetric === 'onhand' ? true : p[mk] > 0);
+    // Allocation-sheet arrangement: brand, then product line, then product name,
+    // with a header row introducing each group.
+    const ordered = tableRows.slice().sort((a, b) => brandLabel(a.brand).localeCompare(brandLabel(b.brand)) || a.line.localeCompare(b.line) || a.name.localeCompare(b.name));
+    const dash = '\u2014';
+    const cases = n => {
+      const r = Math.round(n * 100) / 100;
+      return r.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    };
+    const body = [];
+    let curBrand = null,
+      curLine = null;
+    ordered.forEach((p, i) => {
+      if (p.brand !== curBrand) {
+        curBrand = p.brand;
+        curLine = null;
+        body.push(/*#__PURE__*/React.createElement("tr", {
+          key: 'b' + i,
+          className: "grp-brand"
+        }, /*#__PURE__*/React.createElement("td", {
+          colSpan: 9
+        }, /*#__PURE__*/React.createElement("span", {
+          className: "chip",
+          style: brandChip(p.brand)
+        }, brandLabel(p.brand)))));
+      }
+      if (p.line !== curLine) {
+        curLine = p.line;
+        body.push(/*#__PURE__*/React.createElement("tr", {
+          key: 'l' + i,
+          className: "grp-line"
+        }, /*#__PURE__*/React.createElement("td", {
+          colSpan: 9
+        }, p.line)));
+      }
+      const per = p.unitsPerCase;
+      body.push(/*#__PURE__*/React.createElement("tr", {
+        key: 'p' + i
+      }, /*#__PURE__*/React.createElement("td", null, p.name), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+        style: brandTag(p.brand)
+      }, brandLabel(p.brand))), /*#__PURE__*/React.createElement("td", {
+        className: "dim"
+      }, p.line), /*#__PURE__*/React.createElement("td", {
+        className: "num"
+      }, per ? fmtNum(per) : dash), /*#__PURE__*/React.createElement("td", {
+        className: "num dim"
+      }, per ? fmtMoneyFull(p.casePrice) : dash), /*#__PURE__*/React.createElement("td", {
+        className: "num dim"
+      }, per ? fmtMoneyFull(p.unitPrice) : dash), /*#__PURE__*/React.createElement("td", {
+        className: "num"
+      }, per ? cases(p.availCasesExact) : dash), /*#__PURE__*/React.createElement("td", {
+        className: "num"
+      }, /*#__PURE__*/React.createElement("strong", null, per ? fmtNum(p.availCasesFull) : dash)), /*#__PURE__*/React.createElement("td", {
+        className: "num"
+      }, /*#__PURE__*/React.createElement("strong", null, per ? fmtNum(p.availCasesFull) : dash))));
+    });
     return /*#__PURE__*/React.createElement("section", {
       className: "section"
     }, /*#__PURE__*/React.createElement("div", {
@@ -2031,7 +2132,7 @@ function InventoryDashboard({
       }
     }, /*#__PURE__*/React.createElement("span", {
       className: "section-meta"
-    }, fmtNum(tableRows.length), " SKUs in stock", invMetric !== 'onhand' ? ' \u00b7 ' + (invMetric === 'reserved' ? 'reserved' : 'available') : ''), /*#__PURE__*/React.createElement("select", {
+    }, fmtNum(ordered.length), " SKUs in stock", invMetric !== 'onhand' ? ' \u00b7 ' + (invMetric === 'reserved' ? 'reserved' : 'available') : ''), /*#__PURE__*/React.createElement("select", {
       className: "filter-select",
       style: {
         minWidth: 150
@@ -2045,13 +2146,16 @@ function InventoryDashboard({
       value: b
     }, brandLabel(b))))), /*#__PURE__*/React.createElement(DownloadBtn, {
       onClick: () => exportCSV('inventory.csv', [
-        { key: 'sku', label: 'SKU' },
-        { key: 'name', label: 'Product' },
-        { key: 'brand', label: 'Brand' },
-        { key: 'onHand', label: 'On Hand', fmt: v => (+v || 0) },
-        { key: 'reserved', label: 'Reserved', fmt: v => (+v || 0) },
-        { key: 'available', label: 'Available', fmt: v => (+v || 0) }
-      ], tableRows)
+        { key: 'name', label: 'Product Name' },
+        { key: o => brandLabel(o.brand), label: 'Brand' },
+        { key: 'line', label: 'Product Line' },
+        { key: 'unitsPerCase', label: 'Units Per Case', fmt: v => (+v || 0) },
+        { key: 'casePrice', label: 'Wholesale Price / Case', fmt: v => (+v || 0).toFixed(2) },
+        { key: 'unitPrice', label: 'Price Per Unit', fmt: v => (+v || 0).toFixed(2) },
+        { key: 'availCasesExact', label: 'Avail. Cases (Exact)', fmt: v => (Math.round((+v || 0) * 100) / 100) },
+        { key: 'availCasesFull', label: 'Avail. Full Cases', fmt: v => (+v || 0) },
+        { key: 'availCasesFull', label: 'Remaining Cases Available', fmt: v => (+v || 0) }
+      ], ordered)
     })), /*#__PURE__*/React.createElement("div", {
       className: "card",
       style: {
@@ -2061,40 +2165,23 @@ function InventoryDashboard({
     }, /*#__PURE__*/React.createElement("div", {
       style: {
         overflowX: 'auto',
-        maxHeight: 560
+        maxHeight: 620
       }
     }, /*#__PURE__*/React.createElement("table", {
       className: "data-table"
-    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Product"), /*#__PURE__*/React.createElement("th", null, "Brand"), /*#__PURE__*/React.createElement("th", null, "SKU"), /*#__PURE__*/React.createElement("th", null, "Status"), /*#__PURE__*/React.createElement("th", {
+    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Product Name"), /*#__PURE__*/React.createElement("th", null, "Brand"), /*#__PURE__*/React.createElement("th", null, "Product Line"), /*#__PURE__*/React.createElement("th", {
       className: "num"
-    }, "On Hand"), /*#__PURE__*/React.createElement("th", {
+    }, "Units Per Case"), /*#__PURE__*/React.createElement("th", {
       className: "num"
-    }, "Reserved"), /*#__PURE__*/React.createElement("th", {
+    }, "Wholesale / Case"), /*#__PURE__*/React.createElement("th", {
       className: "num"
-    }, "Available"))), /*#__PURE__*/React.createElement("tbody", null, tableRows.slice(0, 250).map((p, i) => /*#__PURE__*/React.createElement("tr", {
-      key: i
-    }, /*#__PURE__*/React.createElement("td", null, p.name), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
-      style: brandTag(p.brand)
-    }, brandLabel(p.brand))), /*#__PURE__*/React.createElement("td", {
-      className: "dim font-mono",
-      style: {
-        fontSize: 11
-      }
-    }, p.sku), /*#__PURE__*/React.createElement("td", {
-      className: "dim"
-    }, p.status), /*#__PURE__*/React.createElement("td", {
+    }, "Price Per Unit"), /*#__PURE__*/React.createElement("th", {
       className: "num"
-    }, fmtNum(p.onHand)), /*#__PURE__*/React.createElement("td", {
-      className: "num dim"
-    }, fmtNum(p.reserved)), /*#__PURE__*/React.createElement("td", {
+    }, "Avail. Cases (Exact)"), /*#__PURE__*/React.createElement("th", {
       className: "num"
-    }, /*#__PURE__*/React.createElement("strong", {
-      style: {
-        color: p.available <= 0 ? 'var(--rose)' : 'var(--text)'
-      }
-    }, fmtNum(p.available)))))))), tableRows.length > 250 && /*#__PURE__*/React.createElement("div", {
-      className: "table-foot"
-    }, "Showing 250 of ", fmtNum(tableRows.length), " SKUs")));
+    }, "Avail. Full Cases"), /*#__PURE__*/React.createElement("th", {
+      className: "num"
+    }, "Remaining Cases"))), /*#__PURE__*/React.createElement("tbody", null, body)))));
   })(), /*#__PURE__*/React.createElement("section", {
     className: "section"
   }, /*#__PURE__*/React.createElement("div", {
@@ -2134,34 +2221,74 @@ function InventoryDashboard({
     }
   }, /*#__PURE__*/React.createElement("table", {
     className: "data-table"
-  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Product"), /*#__PURE__*/React.createElement("th", null, "Brand"), /*#__PURE__*/React.createElement("th", null, "SKU"), /*#__PURE__*/React.createElement("th", null, "Status"), /*#__PURE__*/React.createElement("th", {
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Product Name"), /*#__PURE__*/React.createElement("th", null, "Brand"), /*#__PURE__*/React.createElement("th", null, "Product Line"), /*#__PURE__*/React.createElement("th", {
+    className: "num"
+  }, "Units Per Case"), /*#__PURE__*/React.createElement("th", {
+    className: "num"
+  }, "Wholesale / Case"), /*#__PURE__*/React.createElement("th", {
+    className: "num"
+  }, "Price Per Unit"), /*#__PURE__*/React.createElement("th", {
     className: "num"
   }, "On Hand"), /*#__PURE__*/React.createElement("th", {
     className: "num"
   }, "Reserved"), /*#__PURE__*/React.createElement("th", {
     className: "num"
-  }, "Available"))), /*#__PURE__*/React.createElement("tbody", null, oosItems.map((p, i) => /*#__PURE__*/React.createElement("tr", {
-    key: i
-  }, /*#__PURE__*/React.createElement("td", null, p.name), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
-    style: brandTag(p.brand)
-  }, brandLabel(p.brand))), /*#__PURE__*/React.createElement("td", {
-    className: "dim font-mono",
-    style: {
-      fontSize: 11
-    }
-  }, p.sku), /*#__PURE__*/React.createElement("td", {
-    className: "dim"
-  }, p.status), /*#__PURE__*/React.createElement("td", {
-    className: "num"
-  }, /*#__PURE__*/React.createElement("strong", null, fmtNum(p.onHand))), /*#__PURE__*/React.createElement("td", {
-    className: "num dim"
-  }, fmtNum(p.reserved)), /*#__PURE__*/React.createElement("td", {
-    className: "num",
-    style: {
-      color: 'var(--rose)'
-    }
-  }, /*#__PURE__*/React.createElement("strong", null, fmtNum(p.available))))), oosItems.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    colSpan: "7",
+  }, "Available"))), /*#__PURE__*/React.createElement("tbody", null, (() => {
+    // Same brand -> product line grouping as the in-stock table above.
+    const out = [];
+    let cb = null,
+      cl = null;
+    const dash = '\u2014';
+    oosItems.forEach((p, i) => {
+      if (p.brand !== cb) {
+        cb = p.brand;
+        cl = null;
+        out.push(/*#__PURE__*/React.createElement("tr", {
+          key: 'b' + i,
+          className: "grp-brand"
+        }, /*#__PURE__*/React.createElement("td", {
+          colSpan: 9
+        }, /*#__PURE__*/React.createElement("span", {
+          className: "chip",
+          style: brandChip(p.brand)
+        }, brandLabel(p.brand)))));
+      }
+      if (p.line !== cl) {
+        cl = p.line;
+        out.push(/*#__PURE__*/React.createElement("tr", {
+          key: 'l' + i,
+          className: "grp-line"
+        }, /*#__PURE__*/React.createElement("td", {
+          colSpan: 9
+        }, p.line)));
+      }
+      const per = p.unitsPerCase;
+      out.push(/*#__PURE__*/React.createElement("tr", {
+        key: 'p' + i
+      }, /*#__PURE__*/React.createElement("td", null, p.name), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+        style: brandTag(p.brand)
+      }, brandLabel(p.brand))), /*#__PURE__*/React.createElement("td", {
+        className: "dim"
+      }, p.line), /*#__PURE__*/React.createElement("td", {
+        className: "num"
+      }, per ? fmtNum(per) : dash), /*#__PURE__*/React.createElement("td", {
+        className: "num dim"
+      }, per ? fmtMoneyFull(p.casePrice) : dash), /*#__PURE__*/React.createElement("td", {
+        className: "num dim"
+      }, per ? fmtMoneyFull(p.unitPrice) : dash), /*#__PURE__*/React.createElement("td", {
+        className: "num"
+      }, /*#__PURE__*/React.createElement("strong", null, fmtNum(p.onHand))), /*#__PURE__*/React.createElement("td", {
+        className: "num dim"
+      }, fmtNum(p.reserved)), /*#__PURE__*/React.createElement("td", {
+        className: "num",
+        style: {
+          color: 'var(--rose)'
+        }
+      }, /*#__PURE__*/React.createElement("strong", null, fmtNum(p.available)))));
+    });
+    return out;
+  })(), oosItems.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: "9",
     style: {
       textAlign: 'center',
       padding: '28px',
