@@ -143,8 +143,14 @@ INV_BRAND_ENDPOINTS = [e.strip() for e in os.getenv(
 # wins). Set LEAFLINK_INVENTORY_CSV to a path to force one, or "off" to disable.
 INVENTORY_CSV = os.getenv("LEAFLINK_INVENTORY_CSV", "")
 
+# Listing states the dashboard treats as sellable stock. "Backorder" products
+# are stocked and orderable, they just aren't showing on the storefront, so they
+# belong on the board alongside Available. "Internal" is deliberately left out:
+# those are internal-only listings (the bulk of them a third-party catalog) and
+# folding them in would swamp the board with thousands of non-sellable rows.
+# Override with LEAFLINK_LISTED_STATES (comma separated) to widen or narrow.
 LISTED_STATES = {s.strip().lower() for s in
-                 os.getenv("LEAFLINK_LISTED_STATES", "available").split(",") if s.strip()}
+                 os.getenv("LEAFLINK_LISTED_STATES", "available,backorder").split(",") if s.strip()}
 STATUS_FIELDS = [f.strip() for f in os.getenv(
     "LEAFLINK_STATUS_FIELDS",
     "listing_state,status,product_status,state,listing_status,product_state"
@@ -1045,6 +1051,12 @@ def inventory_catalog_from_csv():
                     continue
                 if key:
                     seen.add(key)
+                # Units per case is only expressed in the export as the ratio
+                # of the unit and case columns, so derive it here rather than
+                # making the dashboard reverse it out of order history.
+                _u = _csv_num(_csv_col(r, "Inventory (Units)"))
+                _c = _csv_num(_csv_col(r, "Inventory (Cases)"))
+                _per = round(_u / _c, 4) if _u and _c else 0
                 out.append({
                     "id": pid,
                     "sku": sku,
@@ -1052,9 +1064,11 @@ def inventory_catalog_from_csv():
                     "line": str(_csv_col(r, "Product Line") or "").strip(),
                     "status": status,
                     "brand": str(_csv_col(r, "Brand") or "").strip(),
-                    "inventory": _csv_num(_csv_col(r, "Inventory (Units)")),
+                    "inventory": _u,
                     "reserved": _csv_num(_csv_col(r, "Reserved Inventory (Units)")),
                     "available": _csv_num(_csv_col(r, "Available Inventory (Units)")),
+                    "units_per_case": _per,
+                    "case_price": _csv_num(_csv_col(r, "Wholesale Price")),
                 })
     except Exception as e:
         print(f"  NOTE: could not read inventory CSV {path} ({e}); using API catalog.")
