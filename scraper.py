@@ -18,6 +18,7 @@ import csv
 import json
 import gzip
 import os
+import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -78,6 +79,17 @@ EXCLUDE_STATUSES = [s.strip().lower() for s in
 SERVER_DATE_FILTER = os.getenv("LEAFLINK_SERVER_DATE_FILTER", "1") != "0"
 
 PAGE_SIZE = int(os.getenv("LEAFLINK_PAGE_SIZE", "500"))
+
+# Client-side pacing. On a long backfill LeafLink throttles hard, and every 429
+# is far more expensive than simply spacing requests out: a throttled page costs
+# 5-30s of forced sleep AND still has to be re-sent. So we hold a minimum gap
+# between calls, widen it automatically each time we're throttled anyway, and
+# let it relax back down after a clean streak. Net effect is fewer 429s and a
+# shorter run, not a longer one.
+MIN_REQUEST_GAP = float(os.getenv("LEAFLINK_MIN_REQUEST_GAP", "0.35"))
+MAX_REQUEST_GAP = float(os.getenv("LEAFLINK_MAX_REQUEST_GAP", "5"))
+_pace = {"gap": MIN_REQUEST_GAP, "last": 0.0, "clean": 0,
+         "calls": 0, "throttled": 0, "slept": 0.0}
 MAX_PAGES = int(os.getenv("LEAFLINK_MAX_PAGES", "0"))
 
 # Current inventory isn't in the orders feed — it lives in the seller's product
@@ -168,23 +180,60 @@ def auth_headers() -> dict:
     }
 
 
+def _pace_wait():
+    """Hold the current minimum gap since the previous request."""
+    delta = time.monotonic() - _pace["last"]
+    if delta < _pace["gap"]:
+        time.sleep(_pace["gap"] - delta)
+    _pace["last"] = time.monotonic()
+    _pace["calls"] += 1
+
+
+def _retry_after(resp, fallback):
+    """Prefer the server's own Retry-After over our guess when it sends one."""
+    try:
+        return max(float(resp.headers.get("Retry-After")), 1.0)
+    except (AttributeError, TypeError, ValueError):
+        return fallback
+
+
+def pace_report():
+    print(f"Throttling: {_pace['calls']} requests, {_pace['throttled']} throttled, "
+          f"{_pace['slept']:.0f}s spent waiting, final gap {_pace['gap']:.2f}s")
+
+
 def _get(url, params):
     # Robust GET: retry on 429 and transient 5xx so a single hiccup never
     # silently truncates the pull.
     last = None
     for attempt in range(6):
+        _pace_wait()
         try:
             resp = requests.get(url, headers=auth_headers(), params=params, timeout=120)
         except requests.RequestException as e:
             last = e
-            time.sleep(5 * (attempt + 1))
+            wait = min(5 * (attempt + 1), 30)
+            time.sleep(wait)
+            _pace["slept"] += wait
             continue
         if resp.status_code == 429 or 500 <= resp.status_code < 600:
-            wait = 5 * (attempt + 1)
-            print(f"  {resp.status_code} — backing off {wait}s (attempt {attempt+1})")
+            _pace["throttled"] += 1
+            _pace["clean"] = 0
+            if resp.status_code == 429:
+                # Back off the steady-state pace, not just this one request.
+                _pace["gap"] = min(_pace["gap"] * 1.6 + 0.1, MAX_REQUEST_GAP)
+            wait = _retry_after(resp, min(5 * (attempt + 1), 30) + random.uniform(0, 1))
+            print(f"  {resp.status_code} — backing off {wait:.0f}s "
+                  f"(attempt {attempt+1}, pace now {_pace['gap']:.2f}s)")
             time.sleep(wait)
+            _pace["slept"] += wait
             last = resp
             continue
+        # Clean run of responses — ease the pace back toward the floor.
+        _pace["clean"] += 1
+        if _pace["clean"] >= 25 and _pace["gap"] > MIN_REQUEST_GAP:
+            _pace["gap"] = max(MIN_REQUEST_GAP, _pace["gap"] * 0.8)
+            _pace["clean"] = 0
         return resp
     if isinstance(last, requests.Response):
         return last
@@ -1225,6 +1274,7 @@ def main():
         json.dump(payload, f, separators=(",", ":"), default=str)
     size_mb = OUTPUT_FILE.stat().st_size / 1e6
     print(f"\nSaved -> {OUTPUT_FILE} ({size_mb:.2f} MB, {len(rows)} rows)")
+    pace_report()
 
 
 if __name__ == "__main__":
