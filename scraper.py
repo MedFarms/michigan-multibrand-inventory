@@ -164,15 +164,15 @@ INVENTORY_CSV = os.getenv("LEAFLINK_INVENTORY_CSV", "")
 LISTED_STATES = {s.strip().lower() for s in
                  os.getenv("LEAFLINK_LISTED_STATES", "available,backorder").split(",") if s.strip()}
 
-# Sold-out products don't stay in an Available/Backorder state: LeafLink flips
-# them to Internal (unlisted), which is also where the whole third-party 100
-# Shafer catalog lives. Filtering on listing state alone therefore hides almost
-# every out-of-stock SKU. So for OUR brands we keep every listing state, and for
-# everyone else we keep only the sellable ones. Set LEAFLINK_CATALOG_BRANDS to
-# "" to switch this off, or "*" to keep every state for every brand.
+# Optional escape hatch for unlisted stock. Sold-out products don't stay in an
+# Available/Backorder state - LeafLink flips them to Internal (unlisted), which
+# is also where the third-party 100 Shafer catalog lives. Listing an Internal
+# product on the board is therefore a deliberate choice, and it's OFF: the board
+# shows sellable listings only. Set LEAFLINK_CATALOG_BRANDS to a comma-separated
+# brand list to keep every listing state for those brands (this pulls in their
+# unlisted/sold-out SKUs), or "*" for every brand.
 CATALOG_BRANDS = [b.strip() for b in os.getenv(
-    "LEAFLINK_CATALOG_BRANDS",
-    "Hyman,Chill Medicated,Covert Cups,Homiez,Value Pak Distro").split(",") if b.strip()]
+    "LEAFLINK_CATALOG_BRANDS", "").split(",") if b.strip()]
 _CATALOG_BRANDS_LC = {b.lower() for b in CATALOG_BRANDS}
 
 
