@@ -1,2365 +1,1330 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>MedFarms · Inventory</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600;9..144,700&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
+"""
+LeafLink Sales Report Scraper  (Medfarms 100 Shafer — ALL brands)
+-----------------------------------------------------------
+Pulls Orders Received from the LeafLink Marketplace V2 API, flattens to
+per-line-item rows, keeps every brand on the Medfarms (100 Shafer) account, trims
+to the fields the dashboard needs, and writes a compact sales_data.json.
 
-  :root {
-    /* Medfarms · Michigan — "Midnight" dark theme, purple accents.
-       Black page so brand colors pop; white text for contrast. */
-    --bg: #0a0a0c;             /* page — near-black */
-    --bg-elev: #cbcad3;        /* cards — Lighter B */
-    --bg-elev-2: #bcbbc6;      /* section / table-header — one step darker */
-    --border: #c39ad2;         /* original lavender border (reads on light cards) */
-    --border-soft: #d8c8e2;    /* soft divider inside cards */
-    --text: #2c1b3d;           /* deep purple-black — for text ON cards */
-    --text-dim: #5e4a72;
-    --text-faint: #7a6690;
-    --accent: #a82d8a;         /* original magenta — reads on light cards */
-    --accent-dim: #c98ac0;
-    --accent-deep: #4b2e83;    /* original indigo */
-    --warm: #c77d22;
-    --cool: #6a4fb0;
-    --rose: #c23a5e;           /* original crimson */
-    --internal: #8e4fc0;       /* purple — internal stores */
-    --internal-dim: #6e3aa0;
-    /* Text that sits directly on the BLACK PAGE (not on a card) must stay light.
-       Cards use --text (dark) for content; the page chrome uses these. */
-    --text-on-bg: #f4f2f7;
-    --text-on-bg-dim: #b3aec2;
-    --text-on-bg-faint: #7d7791;
+Field mapping is based on the real LeafLink response:
+  - order:  number (uuid), short_id (display #), created_on (date),
+            status, customer.display_name (buyer), total.amount, brand_ids
+  - line:   ordered_unit_price.amount, sale_price.amount, quantity,
+            unit_multiplier, is_sample, frozen_data.product.{name,sku,
+            product_line_name,price,...}
+  - revenue per line = effective_price * (quantity / unit_multiplier)
+"""
 
-    /* surface + motion system */
-    --radius: 10px;
-    --radius-sm: 7px;
-    --shadow-card: 0 1px 0 rgba(255,255,255,0.05) inset, 0 12px 30px -20px rgba(0,0,0,0.7);
-    --ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
-    --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
-  }
+import csv
+import json
+import gzip
+import os
+import random
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+import requests
+from dotenv import load_dotenv
 
-  html, body {
-    background: var(--bg);
-    color: var(--text-on-bg);
-    font-family: 'Inter', sans-serif;
-    font-size: 14px;
-    line-height: 1.5;
-    min-height: 100vh;
-    -webkit-font-smoothing: antialiased;
-  }
-  body {
-    background-image:
-      radial-gradient(ellipse 1200px 600px at 80% -10%, rgba(210,79,176,0.10), transparent 60%),
-      radial-gradient(ellipse 800px 400px at 0% 100%, rgba(123,92,199,0.10), transparent 60%);
-  }
+load_dotenv()
 
-  .font-display { font-family: 'Fraunces', serif; font-variation-settings: "opsz" 144; letter-spacing: -0.02em; }
-  .font-mono { font-family: 'JetBrains Mono', monospace; }
-  .tabular { font-variant-numeric: tabular-nums; }
+API_BASE = os.getenv("LEAFLINK_API_BASE", "https://www.leaflink.com")
+ENDPOINT = os.getenv("LEAFLINK_ENDPOINT", "/api/v2/orders-received/")
+# Customers endpoint — used to enrich orders with the assigned sales rep (and
+# state/license when present), since the orders feed doesn't carry them.
+CUSTOMERS_ENDPOINT = os.getenv("LEAFLINK_CUSTOMERS_ENDPOINT", "/api/v2/customers/")
+# Customers carry the assigned rep as the `managers` field — a list of user IDs.
+# These endpoints (tried in order) resolve those IDs to rep names.
+USERS_ENDPOINTS = [e.strip() for e in os.getenv(
+    "LEAFLINK_USERS_ENDPOINTS",
+    "/api/v2/users/,/api/v2/company-staff/,/api/v2/staff/,/api/v2/team-members/"
+).split(",") if e.strip()]
+API_KEY = os.getenv("LEAFLINK_API_KEY", "")
 
-  .app { max-width: 1600px; margin: 0 auto; padding: 32px 40px 80px; }
+# Keep only line items whose product name / brand contains this (case-insensitive).
+BRAND_FILTER = os.getenv("LEAFLINK_BRAND", "")   # "" = ALL brands on the account
+INCLUDE_CHILDREN = os.getenv("LEAFLINK_INCLUDE_CHILDREN", "line_items")
 
-  /* Top bar */
-  .topbar {
-    display: flex; align-items: flex-end; justify-content: space-between;
-    padding-bottom: 26px;
-    border-bottom: 1px solid var(--border-soft);
-    margin-bottom: 0; position: relative;
-  }
-  .topbar::after {
-    content: ''; position: absolute; left: 0; bottom: -1px; width: 168px; height: 2px;
-    background: linear-gradient(90deg, var(--accent), transparent);
-  }
-  .brand-mark { display: flex; align-items: center; gap: 20px; }
-  .brand-name { color: var(--text-on-bg);
-    font-family: 'Fraunces', serif; font-weight: 500; font-size: 40px;
-    letter-spacing: -0.025em; color: var(--text); line-height: 1;
-  }
-  .brand-name em { color: var(--accent); font-style: italic; font-weight: 400; }
-  .brand-tag {
-    margin-top: 9px; font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
-    text-transform: uppercase; letter-spacing: 0.22em; color: var(--text-faint);
-  }
-  .topbar-meta { color: var(--text-on-bg-dim);
-    display: flex; gap: 18px; align-items: center;
-    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-dim);
-  }
-  .topbar-meta strong { color: var(--text-on-bg); font-weight: 500; }
-  .pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); animation: pulse 2s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+# This is a Michigan-only LeafLink account, so every buyer is in MI. Some buyer
+# records have a mistyped or blank state (e.g. "Nirvana Center - Escanaba" shows
+# "NM"), which clutters the dashboard's state filter. When HOME_STATE is set,
+# every buyer_state is coerced to it; anomalies are still logged so real
+# data-entry issues stay visible. Set LEAFLINK_HOME_STATE="" to disable.
+HOME_STATE = os.getenv("LEAFLINK_HOME_STATE", "MI").strip()
 
-  /* Brand tabs */
-  .tabbar {
-    display: flex; gap: 6px; flex-wrap: wrap;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 34px;
-    padding-top: 8px;
-  }
-  .tab {
-    background: transparent; border: none; cursor: pointer;
-    padding: 18px 26px 16px; position: relative;
-    font-family: 'Inter', sans-serif; color: var(--text-dim);
-    display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
-    transition: color 0.18s var(--ease), background 0.18s var(--ease);
-    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  }
-  .tab:hover { color: var(--text); background: var(--bg-elev); }
-  .tab-name { font-family: 'Space Grotesk', sans-serif; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
-  .tab-sub { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-on-bg-faint); }
-  .tab.active { color: var(--text); }
-  .tab.active .tab-sub { color: var(--accent); }
-  .tab.active::after {
-    content: ''; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 3px;
-    background: var(--accent); border-radius: 3px;
-  }
-  .tab.tab-all .tab-name { font-family: 'Space Grotesk', sans-serif; font-style: normal; font-weight: 500; }
-  .other-menu {
-    position: absolute; top: 100%; left: 0; z-index: 50; min-width: 250px; margin-top: 4px;
-    background: var(--bg-elev-2); border: 1px solid var(--border); border-radius: 4px;
-    padding: 6px; box-shadow: 0 10px 28px rgba(70,30,110,0.28);
-    display: flex; flex-direction: column; gap: 2px;
-  }
-  .other-item {
-    display: flex; justify-content: space-between; gap: 18px; align-items: center;
-    background: transparent; border: none; cursor: pointer; text-align: left;
-    padding: 8px 10px; border-radius: 3px; color: var(--text);
-    font-family: 'Inter', sans-serif; font-size: 13px;
-  }
-  .other-item:hover { background: var(--bg-elev); }
-  .other-item.sel { background: rgba(124,58,237,0.10); color: var(--accent); }
-  .other-rev { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-faint); }
+# Keep only orders on/after this date (matched against created_on). Blank = no floor.
+# Set low to pull ALL historical data from the start (MI adult-use began Dec 2019).
+FROM_DATE = os.getenv("LEAFLINK_FROM_DATE", "2020-01-01")
 
-  /* Quick range pills */
-  .quick-ranges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
-  .quick-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--text-faint); margin-right: 4px; }
-  .quick-pill { background: var(--bg-elev); border: 1px solid var(--border); color: var(--text-dim); padding: 6px 13px; border-radius: 999px; font-family: 'JetBrains Mono', monospace; font-size: 11px; cursor: pointer; transition: color 0.18s var(--ease), border-color 0.18s var(--ease), background 0.18s var(--ease); }
-  .quick-pill:hover { color: var(--text); border-color: var(--text-dim); }
-  .quick-pill.active { background: rgba(124,58,237,0.12); border-color: var(--accent-dim); color: var(--accent); }
+# Incremental mode. When > 0 AND the committed data was already backfilled at the
+# current FROM_DATE, each run pulls only the last N days and MERGES into the
+# existing sales_data.json instead of re-scanning all history. This makes the
+# scheduled (every-15-min) runs fast. The very first run (or any run where the
+# committed data isn't yet backfilled at FROM_DATE) does a one-time FULL pull.
+INCREMENTAL_DAYS = int(os.getenv("LEAFLINK_INCREMENTAL_DAYS", "0"))
 
-  /* Scope cards */
-  .scope-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 30px; }
-  .scope-card { text-align: left; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; cursor: pointer; display: flex; flex-direction: column; gap: 6px; transition: transform 0.2s var(--ease), border-color 0.2s var(--ease), background 0.2s var(--ease), box-shadow 0.2s var(--ease); }
-  .scope-card:hover { border-color: var(--text-dim); background: var(--bg-elev-2); transform: translateY(-2px); }
-  .scope-card.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-  .scope-card.scope-internal.active { border-color: var(--internal); box-shadow: inset 0 0 0 1px var(--internal); }
-  .scope-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: var(--text-faint); }
-  .scope-value { font-family: 'Fraunces', serif; font-size: 30px; line-height: 1.05; color: var(--text); font-variant-numeric: tabular-nums; }
-  .scope-card.active .scope-value { color: var(--accent); }
-  .scope-card.scope-internal.active .scope-value { color: var(--internal); }
-  .scope-sub { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-dim); }
-  @media (max-width: 1100px) { .scope-cards { grid-template-columns: 1fr; } }
+# Restrict to one company by seller id. Medfarms - 100 Shafer Processing = 9105.
+# The App token is already scoped to a single company, but this enforces it
+# explicitly. Blank = no company filter.
+SELLER_ID = os.getenv("LEAFLINK_SELLER_ID", "9105")
 
-  /* Filter bar */
-  .filters {
-    display: flex; gap: 14px; flex-wrap: wrap;
-    padding: 16px 20px; background: var(--bg-elev);
-    border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 30px;
-  }
-  .filter-group { display: flex; flex-direction: column; gap: 6px; min-width: 140px; }
-  .filter-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--text-faint); }
-  .filter-input, .filter-select {
-    background: var(--bg); border: 1px solid var(--border); color: var(--text);
-    padding: 8px 10px; font-family: 'Inter', sans-serif; font-size: 13px;
-    border-radius: var(--radius-sm); outline: none; transition: border-color 0.18s var(--ease);
-  }
-  .filter-input:focus, .filter-select:focus { border-color: var(--accent-dim); }
-  .filter-input::placeholder { color: var(--text-faint); }
-  .filter-reset {
-    background: transparent; border: 1px solid var(--border); color: var(--text-dim);
-    padding: 8px 14px; font-family: 'JetBrains Mono', monospace; font-size: 11px;
-    text-transform: uppercase; letter-spacing: 0.1em; border-radius: var(--radius-sm); cursor: pointer;
-    align-self: flex-end; transition: color 0.18s var(--ease), border-color 0.18s var(--ease);
-  }
-  .filter-reset:hover { color: var(--text); border-color: var(--text-dim); }
+# Statuses to exclude — a "products sold" report does not count these. Comma-sep.
+EXCLUDE_STATUSES = [s.strip().lower() for s in
+                    os.getenv("LEAFLINK_EXCLUDE_STATUSES", "Cancelled,Rejected,Combined,Draft").split(",")
+                    if s.strip()]
+# Send the date floor to the server too (created_on__gte) to avoid pulling all
+# history. If LeafLink rejects it (400), the scraper drops it and falls back to
+# client-side filtering automatically. Set "0" to disable.
+SERVER_DATE_FILTER = os.getenv("LEAFLINK_SERVER_DATE_FILTER", "1") != "0"
 
-  /* KPI grid */
-  .kpi-grid {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
-    background: var(--border); border: 1px solid var(--border);
-    border-radius: var(--radius); overflow: hidden; margin-bottom: 24px;
-    box-shadow: var(--shadow-card);
-  }
-  .kpi { background: var(--bg-elev); padding: 22px 22px; display: flex; flex-direction: column; gap: 6px; position: relative; transition: background 0.25s var(--ease); }
-  .kpi:hover { background: var(--bg-elev-2); }
-  .kpi-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: var(--text-faint); }
-  .kpi-value { font-family: 'Fraunces', serif; font-weight: 400; font-size: 33px; line-height: 1.1; letter-spacing: -0.025em; color: var(--text); font-variant-numeric: tabular-nums; }
-  .kpi-sub { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-dim); margin-top: 2px; }
-  .kpi-accent .kpi-value { color: var(--accent); }
-  .kpi::before { content: ''; position: absolute; top: 0; left: 0; width: 24px; height: 2px; background: var(--accent); opacity: 0; transition: opacity 0.25s var(--ease), width 0.35s var(--ease); }
-  .kpi:hover::before { opacity: 1; width: 56px; }
-  .kpi-accent::before { opacity: 1; width: 100%; }
-  .kpi-accent:hover::before { width: 100%; }
+PAGE_SIZE = int(os.getenv("LEAFLINK_PAGE_SIZE", "500"))
 
-  .section { margin-bottom: 34px; }
-  .section-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 16px; }
-  .section-title { font-family: 'Fraunces', serif; font-weight: 500; font-size: 20px; letter-spacing: -0.01em; color: var(--text-on-bg); }
-  .section-title em { color: var(--text-on-bg-dim); font-style: italic; font-weight: 400; }
-  .section-meta { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-on-bg-faint); text-transform: uppercase; letter-spacing: 0.12em; }
+# Client-side pacing. On a long backfill LeafLink throttles hard, and every 429
+# is far more expensive than simply spacing requests out: a throttled page costs
+# 5-30s of forced sleep AND still has to be re-sent. So we hold a minimum gap
+# between calls, widen it automatically each time we're throttled anyway, and
+# let it relax back down after a clean streak. Net effect is fewer 429s and a
+# shorter run, not a longer one.
+MIN_REQUEST_GAP = float(os.getenv("LEAFLINK_MIN_REQUEST_GAP", "0.35"))
+MAX_REQUEST_GAP = float(os.getenv("LEAFLINK_MAX_REQUEST_GAP", "5"))
+_pace = {"gap": MIN_REQUEST_GAP, "last": 0.0, "clean": 0,
+         "calls": 0, "throttled": 0, "slept": 0.0}
+MAX_PAGES = int(os.getenv("LEAFLINK_MAX_PAGES", "0"))
 
-  .card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; box-shadow: var(--shadow-card); }
+# Current inventory isn't in the orders feed — it lives in the seller's product
+# catalog. We pull it once and join by product id / sku. Endpoints tried in order;
+# inventory field names tried in order (first non-null wins). Both best-effort.
+PRODUCTS_ENDPOINTS = [e.strip() for e in os.getenv(
+    "LEAFLINK_PRODUCTS_ENDPOINTS",
+    "/api/v2/products/"
+).split(",") if e.strip()]
 
-  .grid-2 { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; }
-  .grid-half { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+# Brand-name resolution. LeafLink puts brands on the order as numeric `brand_ids`,
+# not on the product line, so we map id -> name from the brands endpoint. Several
+# candidate paths are tried in order; the first that returns brands wins.
+BRANDS_ENDPOINTS = [e.strip() for e in os.getenv(
+    "LEAFLINK_BRANDS_ENDPOINTS",
+    ",".join([
+        f"/api/v2/brands/?company={SELLER_ID}" if SELLER_ID else "/api/v2/brands/",
+        f"/api/v2/brands/?seller={SELLER_ID}" if SELLER_ID else "",
+        f"/api/v2/companies/{SELLER_ID}/brands/" if SELLER_ID else "",
+        "/api/v2/brands/",
+    ])
+).split(",") if e.strip()]
 
-  /* Rank list */
-  .rank-list { display: flex; flex-direction: column; }
-  .rank-row { display: grid; grid-template-columns: 24px 1fr auto; align-items: center; gap: 14px; padding: 12px 0; border-bottom: 1px solid var(--border-soft); position: relative; }
-  .rank-row:last-child { border-bottom: none; }
-  .rank-num { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
-  .rank-name { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rank-value { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums; font-weight: 500; }
-  .rank-bar { position: absolute; bottom: 0; left: 38px; right: 0; height: 1px; background: var(--accent-dim); opacity: 0.4; }
+# Resolve each line's brand from the product catalog (SKU -> brand). This splits
+# multi-brand orders to the correct brand per line. On by default; needs the
+# catalog pull (same endpoint as inventory).
+RESOLVE_BRANDS_FROM_CATALOG = os.getenv("LEAFLINK_RESOLVE_BRANDS_FROM_CATALOG", "1") != "0"
+# Real LeafLink product inventory fields (per API docs): available_inventory =
+# quantity minus reserved; quantity = total inventory level. Prefer available.
+INV_FIELDS = [f.strip() for f in os.getenv(
+    "LEAFLINK_INV_FIELDS",
+    "available_inventory,quantity,quantity_available,inventory"
+).split(",") if f.strip()]
 
-  /* Table */
-  .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  .data-table th { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--text-faint); font-weight: 500; background: var(--bg-elev-2); position: sticky; top: 0; }
-  .data-table td { padding: 12px 16px; border-bottom: 1px solid var(--border-soft); color: var(--text); }
-  .data-table tr:hover td { background: rgba(124,58,237,0.05); }
-  .data-table .num { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; text-align: right; }
-  .data-table .dim { color: var(--text-dim); }
+# Inventory pull is OFF by default: it can be slow/huge on big catalogs and
+# must never block the orders backfill. Turn on with LEAFLINK_PULL_INVENTORY=1
+# once the right endpoint/field is confirmed. Bounded by INV_MAX_PAGES.
+PULL_INVENTORY = os.getenv("LEAFLINK_PULL_INVENTORY", "0") == "1"
+INV_MAX_PAGES = int(os.getenv("LEAFLINK_INV_MAX_PAGES", "60"))
 
-  /* Internal stores section wrapper */
-  .internal-zone {
-    border: 1px solid var(--internal-dim);
-    border-left: 3px solid var(--internal);
-    border-radius: 4px;
-    padding: 26px 26px 30px;
-    margin-bottom: 34px;
-    background: linear-gradient(180deg, rgba(176,111,214,0.10), transparent 220px);
-  }
-  .internal-zone .kpi-accent .kpi-value { color: var(--internal); }
-  .internal-zone .kpi::before { background: var(--internal); }
-  .internal-badge {
-    display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 10px;
-    text-transform: uppercase; letter-spacing: 0.14em; color: var(--internal);
-    border: 1px solid var(--internal-dim); border-radius: 2px; padding: 3px 9px; margin-bottom: 6px;
-  }
+# Per-brand inventory sweep. LeafLink's company-scoped product list can omit
+# whole brands (it returned only 3 of 5 here). So after the company list, we
+# also query products brand-by-brand using the brand ids auto-discovered from
+# the brands endpoint, and merge (dedup by id/sku). Endpoints/params are tried
+# in order until one returns products for that brand; everything is logged.
+INV_PER_BRAND = os.getenv("LEAFLINK_INV_PER_BRAND", "1") != "0"
+INV_BRAND_PARAMS = [p.strip() for p in os.getenv(
+    "LEAFLINK_INV_BRAND_PARAMS", "brand,brand_id,brand__id").split(",") if p.strip()]
+_DEF_BRAND_EPS = ",".join(filter(None, [
+    f"/api/v2/companies/{SELLER_ID}/products/" if SELLER_ID else "",
+    "/api/v2/products/",
+]))
+INV_BRAND_ENDPOINTS = [e.strip() for e in os.getenv(
+    "LEAFLINK_INV_BRAND_ENDPOINTS", _DEF_BRAND_EPS).split(",") if e.strip()]
 
-  /* Current-inventory zone — allocated, accent-marked block */
-  .inv-zone {
-    border: 1px solid var(--accent-dim);
-    border-left: 3px solid var(--accent);
-    border-radius: var(--radius);
-    padding: 26px 26px 30px;
-    background: linear-gradient(180deg, rgba(124,58,237,0.08), transparent 220px);
-  }
-  .inv-badge {
-    display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 10px;
-    text-transform: uppercase; letter-spacing: 0.14em; color: var(--accent);
-    border: 1px solid var(--accent-dim); border-radius: 2px; padding: 3px 9px;
-    margin-right: 12px; vertical-align: middle;
-  }
+# Only keep products in these listing states (matches the LeafLink "Available"
+# export — drops Archived/Unlisted/etc., e.g. the stray 100k gummy). Field name
+# is tried across candidates since the API key isn't documented explicitly.
+# Committed LeafLink "Inventory Overview" CSV export. The products API can hand
+# back a truncated catalog, so when this file is present in the repo we build the
+# dashboard's inventory list straight from it (authoritative). Drop it in as
+# `inventory.csv` (or keep the dated export name; newest matching inventory*.csv
+# wins). Set LEAFLINK_INVENTORY_CSV to a path to force one, or "off" to disable.
+INVENTORY_CSV = os.getenv("LEAFLINK_INVENTORY_CSV", "")
 
-  /* Status pill */
-  .pill { display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; padding: 3px 8px; border-radius: 2px; border: 1px solid; }
-  .pill-completed { color: var(--accent); border-color: var(--accent-dim); background: rgba(124,58,237,0.08); }
-  .pill-pending { color: var(--warm); border-color: var(--warm); background: rgba(199,125,34,0.12); }
-  .pill-overdue { color: var(--rose); border-color: var(--rose); background: rgba(214,69,127,0.12); }
+# Listing states the dashboard treats as sellable stock. "Backorder" products
+# are stocked and orderable, they just aren't showing on the storefront, so they
+# belong on the board alongside Available. "Internal" is deliberately left out:
+# those are internal-only listings (the bulk of them a third-party catalog) and
+# folding them in would swamp the board with thousands of non-sellable rows.
+# Override with LEAFLINK_LISTED_STATES (comma separated) to widen or narrow.
+LISTED_STATES = {s.strip().lower() for s in
+                 os.getenv("LEAFLINK_LISTED_STATES", "available,backorder").split(",") if s.strip()}
 
-  .empty { text-align: center; padding: 80px 20px; color: var(--text-dim); }
-  .empty h2 { font-family: 'Fraunces', serif; font-weight: 400; font-style: italic; font-size: 28px; margin-bottom: 12px; color: var(--text); }
-  .empty code { display: inline-block; background: var(--bg-elev); border: 1px solid var(--border); padding: 4px 10px; font-family: 'JetBrains Mono', monospace; font-size: 12px; border-radius: 2px; color: var(--accent); margin: 0 2px; }
+# Sold-out products don't stay in an Available/Backorder state: LeafLink flips
+# them to Internal (unlisted), which is also where the whole third-party 100
+# Shafer catalog lives. Filtering on listing state alone therefore hides almost
+# every out-of-stock SKU. So for OUR brands we keep every listing state, and for
+# everyone else we keep only the sellable ones. Set LEAFLINK_CATALOG_BRANDS to
+# "" to switch this off, or "*" to keep every state for every brand.
+CATALOG_BRANDS = [b.strip() for b in os.getenv(
+    "LEAFLINK_CATALOG_BRANDS",
+    "Hyman,Chill Medicated,Covert Cups,Homiez,Value Pak Distro").split(",") if b.strip()]
+_CATALOG_BRANDS_LC = {b.lower() for b in CATALOG_BRANDS}
 
-  @media (max-width: 1100px) {
-    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
-    .grid-2, .grid-half { grid-template-columns: 1fr; }
-  }
 
-  /* Keyboard focus — visible ring on every interactive control */
-  .tab:focus-visible, .quick-pill:focus-visible, .scope-card:focus-visible,
-  .filter-reset:focus-visible, .other-item:focus-visible,
-  .filter-input:focus-visible, .filter-select:focus-visible {
-    outline: none; box-shadow: var(--ring);
-  }
+# Archived / discontinued / deleted products are dead records, not stock. They
+# must never reach the board, not even for our own brands.
+ARCHIVED_STATES = {s.strip().lower() for s in os.getenv(
+    "LEAFLINK_ARCHIVED_STATES", "archived,discontinued,deleted,inactive").split(",") if s.strip()}
+ARCHIVED_FLAGS = ("is_archived", "archived", "is_deleted", "deleted", "is_discontinued")
 
-  /* Respect reduced-motion preference */
-  @media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after {
-      animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
-      transition-duration: 0.001ms !important; scroll-behavior: auto !important;
-    }
-    .scope-card:hover { transform: none; }
-  }
 
-  /* logo-gradient title + circular loading spinner */
-  .brand-grad {
-    background: linear-gradient(95deg, #4b2e83 0%, #8e2f9e 45%, #c23a5e 100%);
-    -webkit-background-clip: text; background-clip: text;
-    -webkit-text-fill-color: transparent; color: transparent;
-  }
-  .brand-sep { color: var(--text-faint); font-weight: 300; margin: 0 4px; }
-  .spinner-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 120px 20px; gap: 18px; }
-  .spinner {
-    width: 54px; height: 54px; border-radius: 50%;
-    border: 4px solid rgba(75,46,131,0.18);
-    border-top-color: var(--accent); border-right-color: #c23a5e;
-    animation: spin 0.85s linear infinite;
-  }
-  .spinner-label { font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-faint); }
-  @keyframes spin { to { transform: rotate(360deg); } }
+def _is_archived(status, product=None):
+    """True for records LeafLink has retired, by state name or boolean flag."""
+    if (status or "").strip().lower() in ARCHIVED_STATES:
+        return True
+    if isinstance(product, dict):
+        for f in ARCHIVED_FLAGS:
+            if product.get(f) is True:
+                return True
+        for f in ("archived_on", "deleted_on"):
+            if product.get(f):
+                return True
+    return False
 
-/* --- suite additions (scope toggle, segmented control, bottom nav, chips) --- */
-.scope-row { display:flex; gap:8px; margin-bottom:20px; }
-.scope-btn { font-family:'JetBrains Mono',monospace; font-size:12px; letter-spacing:.06em; text-transform:uppercase;
-  padding:9px 18px; background:var(--bg-elev); color:var(--text-dim); border:1px solid var(--border);
-  border-radius:var(--radius-sm); cursor:pointer; transition:all .15s var(--ease); }
-.scope-btn:hover { color:var(--text); border-color:var(--accent-dim); }
-.scope-active { background:var(--accent-deep); color:var(--text); border-color:var(--accent); }
-.seg { display:flex; gap:4px; }
-.seg-btn { font-family:'JetBrains Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.08em;
-  padding:5px 12px; background:var(--bg-elev); color:var(--text-dim); border:1px solid var(--border);
-  border-radius:var(--radius-sm); cursor:pointer; transition:all .15s var(--ease); }
-.seg-btn:hover { color:var(--text); }
-.seg-active { background:var(--accent-deep); color:var(--text); border-color:var(--accent); }
-.filter-reset-lg { padding:12px 28px; font-size:13px; align-self:flex-end; margin-left:auto; }
-.chip { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:9px; text-transform:uppercase;
-  letter-spacing:.06em; padding:2px 7px; margin:1px 3px 1px 0; border:1px solid; border-radius:4px; opacity:.9; }
-.table-foot { padding:12px 16px; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-faint);
-  text-align:center; border-top:1px solid var(--border); }
-.bottom-nav { position:fixed; left:0; right:0; bottom:0; z-index:50; display:flex; justify-content:center; gap:6px;
-  padding:10px; background:rgba(10,10,12,0.92); backdrop-filter:blur(10px); border-top:1px solid var(--border); }
-.bn-tab { font-family:'Space Grotesk',sans-serif; font-weight:500; font-size:13px; letter-spacing:.01em;
-  padding:9px 22px; color:var(--text-dim); text-decoration:none; border-radius:var(--radius-sm);
-  border:1px solid transparent; transition:all .15s var(--ease); }
-.bn-tab:hover { color:var(--text); background:var(--bg-elev); }
-.bn-active { color:var(--text); background:var(--accent-deep); border-color:var(--accent); }
-.aging-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:1px; background:var(--border);
-  border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; margin-bottom:36px; }
 
-/* --- revision additions: brand buttons, aging buttons/cards, growth badge --- */
-.brand-btns { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:18px; }
-.brand-btn { display:inline-flex; align-items:center; gap:7px; font-family:'Space Grotesk',sans-serif; font-weight:500;
-  font-size:12.5px; letter-spacing:.01em; padding:8px 16px; background:var(--bg-elev); border:1.5px solid;
-  border-radius:999px; cursor:pointer; transition:all .15s var(--ease); }
-.brand-btn:hover { transform:translateY(-1px); filter:brightness(1.08); }
-.brand-btn .brand-dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; box-shadow:0 0 0 1px rgba(0,0,0,.15) inset; }
-.brand-btn-active { font-weight:600; box-shadow:0 2px 10px -2px rgba(0,0,0,.4); }
-.brand-btn-active .brand-dot { box-shadow:0 0 0 1px rgba(0,0,0,.25) inset; background:rgba(0,0,0,.35) !important; }
+def _keep_listing(status, brand, product=None):
+    """True when a product belongs in the dashboard catalog."""
+    if _is_archived(status, product):
+        return False
+    st = (status or "").strip().lower()
+    if not LISTED_STATES or st in LISTED_STATES:
+        return True
+    if "*" in _CATALOG_BRANDS_LC:
+        return True
+    return (brand or "").strip().lower() in _CATALOG_BRANDS_LC
+STATUS_FIELDS = [f.strip() for f in os.getenv(
+    "LEAFLINK_STATUS_FIELDS",
+    "listing_state,status,product_status,state,listing_status,product_state"
+).split(",") if f.strip()]
+OUTPUT_FILE = Path(__file__).parent / "sales_data.json.gz"
 
-.aging-btns { display:flex; gap:5px; }
-.aging-btn { font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:.04em; padding:8px 11px;
-  background:var(--bg-elev); border:1.5px solid; border-radius:var(--radius-sm); cursor:pointer;
-  transition:all .15s var(--ease); white-space:nowrap; }
-.aging-btn:hover { filter:brightness(1.12); }
-.aging-btn-active { font-weight:700; }
 
-.aging-card { text-align:left; background:var(--bg-elev); border:none; padding:18px 20px; cursor:pointer;
-  display:flex; flex-direction:column; gap:5px; transition:background .15s var(--ease); }
-.aging-card:hover { background:var(--bg-elev-2); }
-.aging-card-active { background:var(--bg-elev-2); box-shadow:inset 0 0 0 1px var(--accent-dim); }
-.aging-grid .kpi { border-radius:0; }
-
-.growth-badge { font-family:'JetBrains Mono',monospace; font-size:13px; font-weight:700; letter-spacing:.03em;
-  display:inline-flex; align-items:center; gap:6px; }
-
-/* --- revision 3: light theme polish, bigger scope cards, sticky footer --- */
-/* inputs readable on lavender page */
-.filter-input, .filter-select { background: var(--bg-elev); }
-
-/* --- multi-entry search box (type-ahead + chips) --- */
-.sb { position:relative; }
-.sb-box { display:flex; flex-wrap:wrap; align-items:center; gap:4px; min-height:38px; padding:4px 6px; cursor:text;
-  background:var(--bg-elev); border:1px solid var(--border); border-radius:var(--radius-sm);
-  transition:border-color .18s var(--ease); }
-.sb-box:focus-within { border-color:var(--accent-dim); }
-.sb-chip { display:inline-flex; align-items:center; gap:5px; max-width:190px; padding:3px 4px 3px 8px;
-  background:var(--accent-deep); color:var(--text-on-bg); border-radius:5px;
-  font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:.02em; }
-.sb-chip > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.sb-x { background:none; border:none; padding:0 3px; cursor:pointer; line-height:1; font-size:13px;
-  color:rgba(255,255,255,.65); }
-.sb-x:hover { color:#fff; }
-.sb-input { flex:1 1 90px; min-width:90px; background:transparent; border:none; outline:none;
-  color:var(--text); font-family:'Inter',sans-serif; font-size:13px; padding:4px 2px; }
-.sb-input::placeholder { color:var(--text-faint); }
-.sb-clear { background:none; border:none; cursor:pointer; padding:2px 4px; color:var(--text-faint);
-  font-family:'JetBrains Mono',monospace; font-size:9px; text-transform:uppercase; letter-spacing:.08em; }
-.sb-clear:hover { color:var(--accent); }
-.sb-caret { flex:none; padding:0 4px; color:var(--text-dim); font-size:11px; pointer-events:none; }
-
-/* --- order-form grouping rows in the inventory table --- */
-.chip { white-space: nowrap; }
-/* Non-"Available" listing states (e.g. Backorder) still carry stock, so they sit
-   in the same table - this tag is what tells them apart. */
-.state-tag { display:inline-block; margin-left:8px; padding:1px 6px; border-radius:4px; vertical-align:middle;
-  background:var(--accent-deep); color:var(--text-on-bg); font-family:'JetBrains Mono',monospace;
-  font-size:9px; text-transform:uppercase; letter-spacing:.07em; white-space:nowrap; }
-.grp-brand td { background:var(--bg-elev-2); border-top:2px solid var(--border); padding-top:11px; padding-bottom:9px; }
-.grp-line td { background:var(--bg-elev); font-family:'JetBrains Mono',monospace; font-size:10px; text-transform:uppercase;
-  letter-spacing:.09em; color:var(--text-dim); padding-top:9px; padding-bottom:5px; }
-.sb-drop { position:absolute; z-index:140; top:calc(100% + 5px); left:0; right:0; min-width:240px;
-  max-height:270px; overflow-y:auto; background:var(--bg-elev); border:1px solid var(--border);
-  border-radius:var(--radius-sm); box-shadow:0 14px 34px -12px rgba(0,0,0,.55); }
-.sb-opt { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:7px 11px;
-  font-size:12px; color:var(--text); cursor:pointer; }
-.sb-opt-hi, .sb-opt:hover { background:var(--bg-elev-2); }
-.sb-opt-v { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.sb-opt-t { flex:none; font-family:'JetBrains Mono',monospace; font-size:9px; text-transform:uppercase;
-  letter-spacing:.07em; color:var(--text-faint); }
-.sb-hint { padding:9px 11px; font-size:11px; color:var(--text-dim); }
-
-/* brand buttons sit lower so they clear the topbar underline */
-.brand-btns { margin-top: 24px; }
-.brand-btn .brand-dot { box-shadow: 0 0 0 1px rgba(70,30,110,0.30) inset; }
-
-/* white text on dark-purple active states */
-.bn-active, .seg-active, .scope-active { color: #fff !important; }
-.bn-active .tab-sub { color: #fff; }
-
-/* Scope cards — bigger text, fuller cards */
-.scope-cards { gap: 16px; margin-bottom: 30px; }
-.scope-card { padding: 26px 28px; min-height: 132px; justify-content: center; gap: 10px; }
-.scope-label { font-size: 12px; letter-spacing: 0.16em; }
-.scope-value { font-size: 46px; line-height: 1.0; }
-@media (max-width: 1100px) { .scope-value { font-size: 38px; } }
-
-/* Reset button — make it pop */
-.filter-reset-lg {
-  background: var(--accent); border: 1.5px solid var(--accent-deep); color: #fff;
-  font-weight: 700; letter-spacing: 0.12em; padding: 12px 30px;
-  box-shadow: 0 6px 18px -6px rgba(124,58,237,0.65); transition: all .15s var(--ease);
-}
-.filter-reset-lg:hover { background: var(--accent-deep); color: #fff; transform: translateY(-1px); box-shadow: 0 9px 22px -6px rgba(124,58,237,0.75); }
-
-/* Sticky footer — brands + nav, slides up on scroll */
-.sticky-foot {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 60;
-  display: flex; align-items: center; justify-content: space-between; gap: 16px;
-  padding: 10px 18px; background: rgba(250,246,253,0.94); backdrop-filter: blur(12px);
-  border-top: 1px solid var(--border); box-shadow: 0 -8px 24px -16px rgba(70,30,110,0.5);
-  transform: translateY(120%); opacity: 0; transition: transform .28s var(--ease), opacity .28s var(--ease);
-}
-.sticky-foot-show { transform: translateY(0); opacity: 1; }
-.sf-brands { display: flex; gap: 6px; flex-wrap: wrap; }
-.sf-brand { display: inline-flex; align-items: center; gap: 6px; font-family: 'Space Grotesk', sans-serif;
-  font-weight: 500; font-size: 11.5px; padding: 6px 12px; border: 1.5px solid; border-radius: 999px;
-  background: var(--bg-elev); cursor: pointer; transition: all .15s var(--ease); }
-.sf-brand:hover { transform: translateY(-1px); }
-.sf-brand-active { font-weight: 700; }
-.sf-dot { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 0 1px rgba(70,30,110,0.30) inset; }
-.sf-nav { display: flex; gap: 6px; }
-.sticky-foot .bn-tab { padding: 7px 16px; font-size: 12.5px; }
-@media (max-width: 760px) { .sf-brand-label { display: none; } .sf-brand { padding: 7px 9px; } }
-
-/* "All brands" buttons */
-.brand-btn-all { border-color: var(--accent-dim); color: var(--accent); font-weight: 600; }
-.brand-btn-all.brand-btn-active { background: var(--accent); border-color: var(--accent-deep); color: #fff; }
-.sf-brand-all { border-color: var(--accent-dim); color: var(--accent); font-weight: 600; }
-.sf-brand-all.sf-brand-active { background: var(--accent); border-color: var(--accent); color: #fff; }
-
-/* --- revision: centered + larger card numbers, maximize card space --- */
-.kpi { align-items: center; text-align: center; justify-content: center; min-height: 124px; gap: 9px; padding: 24px 18px; }
-.kpi-label { text-align: center; }
-.kpi-value { font-size: 44px; line-height: 1.04; overflow-wrap: anywhere; }
-.kpi-sub { text-align: center; font-size: 14px; }
-
-.scope-card { align-items: center; text-align: center; justify-content: center; min-height: 148px; }
-.scope-label { text-align: center; }
-.scope-value { font-size: 58px; line-height: 0.98; }
-
-.aging-card { align-items: center; text-align: center; justify-content: center; min-height: 124px; }
-.aging-card .kpi-label { text-align: center; }
-
-@media (max-width: 1100px) {
-  .kpi-value { font-size: 34px; }
-  .scope-value { font-size: 40px; }
-}
-
-/* pagination */
-.pager { display:flex; align-items:center; justify-content:center; gap:16px; padding:14px 16px; border-top:1px solid var(--border); }
-.pager-btn { font-family:'JetBrains Mono',monospace; font-size:12px; padding:7px 16px; background:var(--bg-elev-2);
-  border:1.5px solid var(--accent-dim); color:var(--accent); border-radius:999px; cursor:pointer; transition:all .15s var(--ease); }
-.pager-btn:hover:not(:disabled) { background:var(--accent); color:#fff; border-color:var(--accent); }
-.pager-btn:disabled { opacity:.4; cursor:default; }
-.pager-info { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-dim); letter-spacing:.04em; }
-.inv-clickable tbody tr { cursor:pointer; }
-.inv-clickable tbody tr:hover td { background:rgba(168,45,138,0.07); }
-.focus-banner { display:flex; align-items:center; justify-content:space-between; gap:12px; background:var(--bg-elev);
-  border:1px solid var(--accent-dim); border-left:3px solid var(--accent); border-radius:var(--radius-sm);
-  padding:10px 16px; margin-bottom:16px; font-size:13px; }
-.focus-clear { font-family:'JetBrains Mono',monospace; font-size:11px; padding:5px 12px; background:var(--accent);
-  color:#fff; border:none; border-radius:999px; cursor:pointer; letter-spacing:.06em; }
-
-/* Sticky-footer back-to-hub link */
-.bn-back { color: var(--text); border-color: var(--accent); font-weight: 600; }
-.bn-back:hover { background: var(--accent-deep); color: #fff !important; border-color: var(--accent); }
-
-/* Scope-card caption */
-.scope-sub { margin-top: 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: .04em; color: var(--text-faint); }
-
-</style>
-</head>
-<body>
-<div id="root"></div>
-<script src="react.production.min.js"></script>
-<script src="react-dom.production.min.js"></script>
-<script src="prop-types.min.js"></script>
-<script src="Recharts.js"></script>
-<script src="pako.min.js"></script>
-<script>
-/* =====================================================================
-   SHARED FOUNDATION  ·  MedFarms multi-dashboard suite
-   Helpers, business logic, data loading, and common UI components.
-   This block is identical across the Sales / AR / Inventory / Rep
-   dashboards so they stay perfectly consistent.
-   ===================================================================== */
-const {
-  useState,
-  useEffect,
-  useMemo,
-  useRef
-} = React;
-
-/* ---- Recharts CDN guard --------------------------------------------- */
-if (typeof Recharts === 'undefined') {
-  document.getElementById('root').innerHTML = '<div style="max-width:560px;margin:80px auto;padding:28px;background:#1c2f22;border:1px solid #33543e;border-radius:10px;color:#eaf6ed;font-family:sans-serif">' + '<h2 style="font-family:Fraunces,serif;font-style:italic;font-weight:400;margin-bottom:10px">Charts library didn’t load</h2>' + '<p style="color:#9dc1a9;line-height:1.6">Recharts failed to load from the CDN — usually an ad-blocker or offline/firewall. Disable blockers for this page, or refresh.</p></div>';
-  throw new Error('Recharts failed to load');
-}
-const {
-  ResponsiveContainer,
-  ComposedChart,
-  LineChart,
-  Line,
-  BarChart,
-  Bar,
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  PieChart,
-  Pie,
-  Cell
-} = Recharts;
-
-/* ---- Number / date helpers ------------------------------------------ */
-const parseMoney = str => {
-  if (str == null) return 0;
-  if (typeof str === 'number') return str;
-  let s = String(str).replace(/[$,\s]/g, '');
-  if (/^\(.*\)$/.test(s)) s = '-' + s.slice(1, -1);
-  const n = parseFloat(s);
-  return isNaN(n) ? 0 : n;
-};
-const fmtMoney = n => {
-  if (n == null || isNaN(n)) return '—';
-  const a = Math.abs(n);
-  if (a >= 1e6) return '$' + (n / 1e6).toFixed(2) + 'M';
-  if (a >= 1e3) return '$' + (n / 1e3).toFixed(1) + 'K';
-  return '$' + n.toLocaleString(undefined, {
-    maximumFractionDigits: 0
-  });
-};
-const fmtMoneyFull = n => '$' + (n || 0).toLocaleString(undefined, {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2
-});
-const fmtNum = n => (Math.round(n) || 0).toLocaleString();
-const fmtPct = n => n == null || isNaN(n) ? '—' : (n >= 0 ? '' : '') + n.toFixed(1) + '%';
-const parseDate = str => {
-  if (!str) return null;
-  const s = String(str).trim();
-  const ymdM = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (ymdM) return new Date(+ymdM[1], +ymdM[2] - 1, +ymdM[3]);
-  const mdyM = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  if (mdyM) return new Date(+mdyM[3], +mdyM[1] - 1, +mdyM[2]);
-  const d = new Date(s);
-  return isNaN(d) ? null : d;
-};
-const ymd = d => {
-  if (!(d instanceof Date) || isNaN(d)) return '';
-  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-};
-const daysBetween = (a, b) => Math.floor((a.getTime() - b.getTime()) / 86400000);
-
-/* ---- Business logic (mirrors the live MedFarms dashboard) ----------- */
-const PRIMARY_BRANDS = ["Hyman", "Chill Medicated", "Value Pak Distro", "100 Shafer", "Homiez", "Covert Cups"];
-const OTHER_ALIASES = {
-  "Brand 2402": "Mitten Extracts",
-  "Brand 2994": "Hashish Boyz",
-  "Brand 2993": "LayerCakeFarms"
-};
-const EXCLUDE_ACCOUNTS = ["Chill CBD Ecommerce", "Dispo Ace Production", "GNO"]; // EXACT match only
-const INTERNAL_STORES = ["Dispo - Bay City North", "Dispo - Bay City South", "Dispo - Battle Creek (Fire Creek)", "Dispo - Hazel Park", "Dispo - Romeo", "Dispo - Whitmore Lake"];
-const EXCLUDED_STATUS = {
-  combined: 1,
-  draft: 1,
-  cancelled: 1,
-  rejected: 1
-};
-
-// Brand colors. NOTE: placeholders matching the client's requested hues
-// (Hyman=orange, Chill=blue, Covert=electric yellow, Homiez=hot pink,
-// Value Pak=light). Swap these exact hex values once Towbey sends the brand sheet.
-const BRAND_COLORS = {
-  "Hyman": "#ef8c3a",
-  // orange
-  "Chill Medicated": "#3f9ae0",
-  // blue
-  "Covert Cups": "#eaf031",
-  // electric yellow
-  "Homiez": "#ff479e",
-  // hot pink
-  "Value Pak Distro": "#f4f4f4",
-  // white
-  "100 Shafer": "#68ba7f",
-  // (unspecified) green
-  "Other Brands": "#9dc1a9"
-};
-const brandColor = b => BRAND_COLORS[b] || "#9dc1a9";
-const brandChip = b => {
-  var c = brandColor(b);
-  if (b === "Covert Cups") return { color: "#eaf031", borderColor: "#eaf031", background: "#000", opacity: 1 };
-  if (b === "Value Pak Distro") return { color: "#ffffff", borderColor: "#ffffff", background: "#000", opacity: 1 };
-  return { color: c, borderColor: c };
-};
-// --- Multi-entry search --------------------------------------------------
-// `terms` is an array of strings. A row matches if ANY term appears in its
-// searchable text, so several buyers / invoices / products can be stacked in
-// one search. Empty array = no filtering.
-const matchesSearch = (terms, hay) => {
-  if (!terms || !terms.length) return true;
-  const h = String(hay).toLowerCase();
-  for (let i = 0; i < terms.length; i++) {
-    if (h.indexOf(String(terms[i]).toLowerCase()) !== -1) return true;
-  }
-  return false;
-};
-
-// Search field with live suggestions. Type to see matching values from the
-// dataset (tagged by what they are), Enter or click to pin one as a chip.
-// Enter also accepts free text that isn't in the list. Backspace on an empty
-// input removes the last chip.
-function SearchBox(props) {
-  const terms = props.terms || [];
-  const options = props.options || [];
-  const [q, setQ] = useState('');
-  const [open, setOpen] = useState(false);
-  const [hi, setHi] = useState(0);
-  const wrap = useRef(null);
-  const box = useRef(null);
-  useEffect(() => {
-    const away = e => {
-      if (wrap.current && !wrap.current.contains(e.target)) setOpen(false);
-    };
-    document.addEventListener('mousedown', away);
-    return () => document.removeEventListener('mousedown', away);
-  }, []);
-  const matches = useMemo(() => {
-    const s = q.trim().toLowerCase();
-    if (!s && !props.allOnFocus) return [];
-    const taken = {};
-    terms.forEach(t => {
-      taken[String(t).toLowerCase()] = 1;
-    });
-    const hits = [];
-    for (let i = 0; i < options.length; i++) {
-      const o = options[i];
-      const lv = o.v.toLowerCase();
-      if (taken[lv]) continue;
-      const at = s ? lv.indexOf(s) : 0;
-      if (at === -1) continue;
-      hits.push({ v: o.v, t: o.t, at: at });
-      if (hits.length >= 400) break;
-    }
-    if (s) hits.sort((a, b) => a.at - b.at || a.v.length - b.v.length);
-    return hits.slice(0, s ? 40 : 200);
-  }, [q, options, terms]);
-  const add = v => {
-    v = String(v == null ? '' : v).trim();
-    if (!v) return;
-    if (!terms.some(t => String(t).toLowerCase() === v.toLowerCase())) props.onChange(terms.concat([v]));
-    setQ('');
-    setHi(0);
-    setOpen(false);
-  };
-  const drop = i => props.onChange(terms.filter((_, j) => j !== i));
-  const onKey = e => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setOpen(true);
-      setHi(h => Math.min(h + 1, Math.max(matches.length - 1, 0)));
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setHi(h => Math.max(h - 1, 0));
-    } else if (e.key === 'Enter' || e.key === ',') {
-      e.preventDefault();
-      if (open && matches[hi]) add(matches[hi].v);else if (!props.strict) add(q);
-    } else if (e.key === 'Escape') {
-      setOpen(false);
-    } else if (e.key === 'Backspace' && q === '' && terms.length) {
-      drop(terms.length - 1);
-    }
-  };
-  return /*#__PURE__*/React.createElement("div", {
-    className: "sb",
-    ref: wrap
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "sb-box",
-    onClick: () => box.current && box.current.focus()
-  }, terms.map((t, i) => /*#__PURE__*/React.createElement("span", {
-    key: i,
-    className: "sb-chip",
-    title: t
-  }, /*#__PURE__*/React.createElement("span", null, t), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    className: "sb-x",
-    title: "Remove",
-    onClick: e => {
-      e.stopPropagation();
-      drop(i);
-    }
-  }, "\u00d7"))), /*#__PURE__*/React.createElement("input", {
-    ref: box,
-    type: "text",
-    className: "sb-input",
-    placeholder: terms.length ? 'add another\u2026' : props.placeholder || 'search\u2026',
-    value: q,
-    onChange: e => {
-      setQ(e.target.value);
-      setOpen(true);
-      setHi(0);
-    },
-    onFocus: () => setOpen(true),
-    onKeyDown: onKey
-  }), terms.length > 1 && /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    className: "sb-clear",
-    title: "Clear all search terms",
-    onClick: e => {
-      e.stopPropagation();
-      props.onChange([]);
-    }
-  }, "clear"), props.allOnFocus && /*#__PURE__*/React.createElement("span", {
-    className: "sb-caret"
-  }, "\u25be")), open && (props.allOnFocus || q.trim().length > 0) && /*#__PURE__*/React.createElement("div", {
-    className: "sb-drop"
-  }, matches.length === 0 ? /*#__PURE__*/React.createElement("div", {
-    className: "sb-hint"
-  }, q.trim() ? props.strict ? "No match" : "No match \u2014 press Enter to search this text anyway" : "Nothing left to add") : matches.map((m, i) => /*#__PURE__*/React.createElement("div", {
-    key: m.t + '|' + m.v,
-    className: 'sb-opt' + (i === hi ? ' sb-opt-hi' : ''),
-    onMouseEnter: () => setHi(i),
-    onMouseDown: e => {
-      e.preventDefault();
-      add(m.v);
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "sb-opt-v"
-  }, m.v), m.t && /*#__PURE__*/React.createElement("span", {
-    className: "sb-opt-t"
-  }, m.t)))));
-}
-// Inline (non-chip) brand name labels. Same rule as brandChip: Covert Cups =
-// electric yellow on solid black, Value Pak = white on solid black. Every other
-// brand keeps its plain brand-colored text.
-// Brand color used as *text* on the light cards. The paler brand hues (Covert
-// Cups electric yellow, Value Pak white) disappear against the lavender card,
-// so anything above a readable luminance gets a darkened version instead.
-const brandInk = b => {
-  const c = brandColor(b);
-  const m = /^#([0-9a-fA-F]{6})$/.exec(c);
-  if (!m) return c;
-  const n = parseInt(m[1], 16);
-  const r = n >> 16 & 255,
-    g = n >> 8 & 255,
-    bl = n & 255;
-  if (0.299 * r + 0.587 * g + 0.114 * bl < 165) return c;
-  const h = v => Math.round(v * 0.45).toString(16).padStart(2, '0');
-  return '#' + h(r) + h(g) + h(bl);
-};
-
-const brandTag = b => {
-  const s = brandChip(b);
-  // Small and non-wrapping so two-word brands ("Covert Cups", "Value Pak") stay
-  // on one line even in a narrow table column or card header.
-  const base = { fontSize: 11, whiteSpace: 'nowrap', display: 'inline-block' };
-  return s.background ? Object.assign(base, { color: s.color, background: '#000', padding: '1px 6px', borderRadius: 4 }) : Object.assign(base, { color: s.color });
-};
-function exportCSV(filename, columns, rows) {
-  const esc = v => { if (v == null) v = ''; v = String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
-  const head = columns.map(c => esc(c.label)).join(',');
-  const body = rows.map(r => columns.map(c => { let val = typeof c.key === 'function' ? c.key(r) : r[c.key]; if (c.fmt) val = c.fmt(val, r); return esc(val); }).join(',')).join('\n');
-  const blob = new Blob([head + '\n' + body], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-function DownloadBtn(props) {
-  return React.createElement('button', { className: 'filter-select', onClick: props.onClick, style: { cursor: 'pointer', whiteSpace: 'nowrap' }, title: 'Download current view as CSV (opens in Excel)' }, '\u2193 CSV');
-}
-const BRAND_LABEL = {
-  "Value Pak Distro": "Value Pak"
-};
-const brandLabel = b => BRAND_LABEL[b] || b;
-
-// On the black theme, the bright/pale brands (Covert Cups yellow, Value Pak
-// near-white) read best as a filled chip: solid black fill, brand-colored
-// border + text. Other brands keep the plain colored-text style.
-const FILLED_CHIP_BRANDS = new Set(["Covert Cups", "Value Pak Distro"]);
-const brandChipStyle = b => {
-  const c = brandColor(b);
-  return FILLED_CHIP_BRANDS.has(b) ? {
-    color: c,
-    borderColor: c,
-    background: '#000',
-    opacity: 1
-  } : {
-    color: c,
-    borderColor: c
-  };
-};
-// readable text color on a given fill
-const textOn = hex => {
-  const c = String(hex).replace('#', '');
-  if (c.length < 6) return '#15241a';
-  const r = parseInt(c.slice(0, 2), 16),
-    g = parseInt(c.slice(2, 4), 16),
-    b = parseInt(c.slice(4, 6), 16);
-  return 0.299 * r + 0.587 * g + 0.114 * b > 150 ? '#15241a' : '#ffffff';
-};
-
-// Aging color scheme (client spec): Current green, 31-60 yellow, 61-90 orange, 91+ red
-const AGING = [{
-  key: 'current',
-  label: 'Current',
-  color: '#2e9e57'
-}, {
-  key: 'b31',
-  label: '31–60 days',
-  color: '#caa11e'
-}, {
-  key: 'b61',
-  label: '61–90 days',
-  color: '#e07b2a'
-}, {
-  key: 'b91',
-  label: '91+ days',
-  color: '#d6433f'
-}];
-const agingBucket = days => days <= 30 ? AGING[0] : days <= 60 ? AGING[1] : days <= 90 ? AGING[2] : AGING[3];
-// "Last Order Date" segment labels (same buckets/colors as AGING)
-const RECENCY_LABEL = {
-  current: '30 days',
-  b31: '60 days',
-  b61: '90 days',
-  b91: '90+ days'
-};
-const SERIES_COLORS = ["#4b2e83", "#6a2f9e", "#8e2f9e", "#a82d8a", "#c23a5e", "#7c3aed", "#b0317a", "#c084fc"];
-// High-contrast palette (distinct hues) for category mixes and multi-year lines
-const CONTRAST = ["#2563eb", "#e0792a", "#16a34a", "#dc2626", "#7c3aed", "#0891b2", "#ca8a04", "#db2777", "#0d9488", "#9333ea", "#65a30d", "#be123c"];
-// Quick date ranges (anchored to today)
-const QUICK_RANGES = [{
-  key: 'today',
-  label: 'Today'
-}, {
-  key: 'week',
-  label: 'Last week'
-}, {
-  key: '30',
-  label: '30 days'
-}, {
-  key: '90',
-  label: '90 days'
-}, {
-  key: 'ytd',
-  label: 'YTD'
-}];
-const quickRangeDates = key => {
-  const t = new Date();
-  const to = ymd(t);
-  const back = n => {
-    const x = new Date(t);
-    x.setDate(x.getDate() - n);
-    return ymd(x);
-  };
-  if (key === 'today') return {
-    from: to,
-    to
-  };
-  if (key === 'week') return {
-    from: back(7),
-    to
-  };
-  if (key === '30') return {
-    from: back(30),
-    to
-  };
-  if (key === '90') return {
-    from: back(90),
-    to
-  };
-  if (key === 'ytd') return {
-    from: ymd(new Date(t.getFullYear(), 0, 1)),
-    to
-  };
-  return {
-    from: '',
-    to: ''
-  };
-};
-const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-// Canonical sales-rep roster (always offered in rep filters/tabs even if absent from a given slice)
-const REP_ROSTER = ["Towbey Kassa", "Darren Dabish", "Steven Kirma", "Cristina Moceri", "Shawn Dabish"];
-const isPrimaryName = b => PRIMARY_BRANDS.includes((b || "").trim());
-const otherName = raw => {
-  const b = (raw || "").trim();
-  return OTHER_ALIASES[b] || b || "(unlabeled)";
-};
-const classifyAccount = buyerName => {
-  const n = String(buyerName || '').trim().toLowerCase();
-  if (!n) return 'wholesale';
-  for (const e of EXCLUDE_ACCOUNTS) if (n === e.toLowerCase()) return 'excluded';
-  for (const s of INTERNAL_STORES) if (n.startsWith(s.toLowerCase())) return 'internal';
-  return 'wholesale';
-};
-
-// Per-order brand set (across ALL rows of the order) -> "contains" semantics.
-const buildOrderBrands = rows => {
-  const ob = {};
-  for (const r of rows) {
-    const id = r.order_uid || r.order_number || '';
-    if (!id) continue;
-    ob[id] || (ob[id] = new Set());
-    String(r.brand || '').split(',').map(s => s.trim()).filter(Boolean).forEach(t => ob[id].add(isPrimaryName(t) ? t : otherName(t)));
-  }
-  return ob;
-};
-
-// Normalize rows into the working shape every sales-style dashboard uses.
-const normalizeRows = rows => {
-  const ob = buildOrderBrands(rows);
-  return rows.map(r => {
-    const id = r.order_uid || r.order_number || '';
-    const bset = ob[id] ? [...ob[id]] : [];
-    const prims = bset.filter(isPrimaryName);
+# ----------------------------------------------------------------------------
+def auth_headers() -> dict:
     return {
-      ...r,
-      _id: id,
-      _date: parseDate(r.order_date),
-      _delivery: parseDate(r.delivery_date),
-      _revenue: parseMoney(r.revenue),
-      _gross: parseMoney(r.gross),
-      _discount: parseMoney(r.discount),
-      _qty: parseFloat(r.quantity) || 0,
-      _units: parseFloat(r.units_sold) || 0,
-      _rep: r.sales_rep && String(r.sales_rep).trim() ? String(r.sales_rep).trim() : 'Unassigned',
-      _term: r.payment_term && String(r.payment_term).trim() ? String(r.payment_term).trim() : '—',
-      _bucket: classifyAccount(r.buyer_name),
-      _brands: bset,
-      _primaries: prims,
-      _hasOther: bset.some(b => !isPrimaryName(b)),
-      _excludedStatus: !!EXCLUDED_STATUS[String(r.order_status || '').trim().toLowerCase()]
-    };
-  });
-};
+        "Authorization": f"App {API_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "chill-sales-dashboard",
+    }
 
-/* ---- Data loader (gz via pako, plain-json fallback) ----------------- */
-// Read the data straight from the repo rather than from whatever copy the host
-// is serving. A Cloudflare Worker bundles its static assets at deploy time, so a
-// relative 'sales_data.json.gz' resolves to the snapshot taken when the Worker
-// was last deployed - the scraper's commits never reach the page and the board
-// looks frozen until someone redeploys. The raw URL always reflects main.
-// Falls back to the local file if the raw host can't be reached.
-const DATA_URL = 'https://raw.githubusercontent.com/MedFarms/michigan-multibrand-inventory/main/sales_data.json.gz';
-const DATA_FALLBACK = 'sales_data.json.gz';
 
-function useData(file) {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState(null);
-  useEffect(() => {
-    const load = () => {
-      const primary = file || DATA_URL;
-      // raw.githubusercontent caches for 5 minutes; the timestamp busts it so a
-      // fresh scrape shows up on the next poll instead of up to 5 min later.
-      const grab = u => fetch(u + '?t=' + Date.now()).then(r => {
-        if (!r.ok) throw new Error('Could not load ' + u + ' (HTTP ' + r.status + ')');
-        return r.arrayBuffer();
-      });
-      grab(primary).catch(e => {
-        if (primary === DATA_FALLBACK) throw e;
-        console.warn('Falling back to the bundled data file:', e.message);
-        return grab(DATA_FALLBACK);
-      }).then(buf => {
-        const bytes = new Uint8Array(buf);
-        let text;
-        if (bytes[0] === 0x1f && bytes[1] === 0x8b) text = pako.ungzip(bytes, {
-          to: 'string'
-        });else text = new TextDecoder().decode(bytes);
-        setData(JSON.parse(text));
-      }).catch(e => setError(e.message));
-    };
-    load();
-    const id = setInterval(load, 60000);
-    return () => clearInterval(id);
-  }, [file]);
-  return {
-    data,
-    error
-  };
-}
+def _pace_wait():
+    """Hold the current minimum gap since the previous request."""
+    delta = time.monotonic() - _pace["last"]
+    if delta < _pace["gap"]:
+        time.sleep(_pace["gap"] - delta)
+    _pace["last"] = time.monotonic()
+    _pace["calls"] += 1
 
-/* ---- Common UI components ------------------------------------------- */
-function Topbar({
-  section,
-  fetchedAt,
-  right
-}) {
-  const ago = fetchedAt ? Math.floor((Date.now() - fetchedAt.getTime()) / 60000) : null;
-  return /*#__PURE__*/React.createElement("div", {
-    className: "topbar"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "brand-mark",
-    style: {
-      alignItems: 'center',
-      gap: 16
-    }
-  }, /*#__PURE__*/React.createElement("img", {
-    src: "logo.png",
-    alt: "MEDfarms",
-    style: {
-      height: 50,
-      width: 'auto',
-      flexShrink: 0
-    },
-    onError: e => {
-      e.target.style.display = 'none';
-    }
-  }), /*#__PURE__*/React.createElement("h1", {
-    className: "brand-name",
-    style: {
-      lineHeight: 1,
-      fontSize: 27
-    }
-  }, /*#__PURE__*/React.createElement("em", {
-    style: {
-      color: 'var(--text-dim)',
-      fontStyle: 'italic',
-      fontWeight: 400
-    }
-  }, section))), /*#__PURE__*/React.createElement("div", {
-    className: "topbar-meta"
-  }, right, ago != null && /*#__PURE__*/React.createElement("span", null, "Updated ", ago < 1 ? 'just now' : ago + 'm ago'), /*#__PURE__*/React.createElement("span", {
-    className: "pulse"
-  })));
-}
-function Spinner({
-  label
-}) {
-  return /*#__PURE__*/React.createElement("div", {
-    className: "spinner-wrap"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "spinner"
-  }), /*#__PURE__*/React.createElement("div", {
-    className: "spinner-label"
-  }, label || 'Loading'));
-}
-function Kpi({
-  label,
-  value,
-  sub,
-  accent,
-  color
-}) {
-  return /*#__PURE__*/React.createElement("div", {
-    className: 'kpi' + (accent ? ' kpi-accent' : '')
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "kpi-label"
-  }, label), /*#__PURE__*/React.createElement("div", {
-    className: "kpi-value tabular",
-    style: color ? {
-      color
-    } : null
-  }, value), sub && /*#__PURE__*/React.createElement("div", {
-    className: "kpi-sub"
-  }, sub));
-}
-function SectionHeader({
-  title,
-  em,
-  meta
-}) {
-  return /*#__PURE__*/React.createElement("div", {
-    className: "section-header"
-  }, /*#__PURE__*/React.createElement("h2", {
-    className: "section-title"
-  }, title, " ", em && /*#__PURE__*/React.createElement("em", null, em)), meta && /*#__PURE__*/React.createElement("span", {
-    className: "section-meta"
-  }, meta));
-}
-function RankList({
-  data,
-  colorByName
-}) {
-  const max = Math.max(...data.map(d => d.value), 1);
-  return /*#__PURE__*/React.createElement("div", {
-    className: "rank-list"
-  }, data.length === 0 && /*#__PURE__*/React.createElement("div", {
-    style: {
-      padding: 20,
-      color: 'var(--text-faint)',
-      textAlign: 'center',
-      fontSize: 13
-    }
-  }, "No data"), data.map((d, i) => /*#__PURE__*/React.createElement("div", {
-    key: i,
-    className: "rank-row"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "rank-num"
-  }, String(i + 1).padStart(2, '0')), /*#__PURE__*/React.createElement("div", {
-    className: "rank-name",
-    title: d.name
-  }, colorByName && /*#__PURE__*/React.createElement("span", {
-    style: {
-      display: 'inline-block',
-      width: 8,
-      height: 8,
-      borderRadius: 2,
-      background: brandColor(d.name),
-      marginRight: 8
-    }
-  }), d.name), /*#__PURE__*/React.createElement("div", {
-    className: "rank-value"
-  }, d.display || fmtMoneyFull(d.value)), /*#__PURE__*/React.createElement("div", {
-    className: "rank-bar",
-    style: {
-      width: 'calc(' + (d.value / max * 100).toFixed(1) + '% - 80px)'
-    }
-  }))));
-}
-function StatusPill({
-  status
-}) {
-  if (!status) return /*#__PURE__*/React.createElement("span", {
-    className: "dim"
-  }, "—");
-  const s = status.toLowerCase();
-  const cls = s.includes('paid') && !s.includes('un') ? 'pill-completed' : s.includes('overdue') ? 'pill-overdue' : 'pill-pending';
-  return /*#__PURE__*/React.createElement("span", {
-    className: 'pill ' + cls
-  }, status);
-}
-function Empty({
-  title,
-  children
-}) {
-  return /*#__PURE__*/React.createElement("div", {
-    className: "empty"
-  }, /*#__PURE__*/React.createElement("h2", null, title), children);
-}
 
-/* ---- Scope cards (External / Internal / Total) ---------------------- */
-function ScopeCards({
-  scope,
-  setScope,
-  values,
-  fmt,
-  sub
-}) {
-  const f = fmt || fmtMoney;
-  const items = [['external', 'External'], ['internal', 'Internal'], ['total', 'Total']];
-  return /*#__PURE__*/React.createElement("div", {
-    className: "scope-cards"
-  }, items.map(([k, l]) => /*#__PURE__*/React.createElement("button", {
-    key: k,
-    className: 'scope-card' + (k === 'internal' ? ' scope-internal' : '') + (scope === k ? ' active' : ''),
-    onClick: () => setScope(k)
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "scope-label"
-  }, l), /*#__PURE__*/React.createElement("div", {
-    className: "scope-value tabular"
-  }, f(values[k] || 0)), sub && /*#__PURE__*/React.createElement("div", {
-    className: "scope-sub"
-  }, sub))));
-}
+def _retry_after(resp, fallback):
+    """Prefer the server's own Retry-After over our guess when it sends one."""
+    try:
+        return max(float(resp.headers.get("Retry-After")), 1.0)
+    except (AttributeError, TypeError, ValueError):
+        return fallback
 
-/* ---- Colored brand filter buttons ----------------------------------- */
-function BrandButtons({
-  brands,
-  value,
-  onChange
-}) {
-  const list = brands.filter(b => b !== '100 Shafer');
-  return /*#__PURE__*/React.createElement("div", {
-    className: "brand-btns"
-  }, /*#__PURE__*/React.createElement("button", {
-    className: 'brand-btn brand-btn-all' + (value === '' ? ' brand-btn-active' : ''),
-    onClick: () => onChange('')
-  }, "All brands"), list.map(b => {
-    const active = value === b;
-    const c = brandColor(b);
-    const light = textOn(c) === '#15241a'; // brand fill is pale (e.g. white, yellow)
-    const style = active ? {
-      background: c,
-      borderColor: light ? '#b58fc9' : c,
-      color: textOn(c)
-    } : {
-      borderColor: light ? 'var(--border)' : c,
-      color: light ? 'var(--text)' : c
-    };
-    return /*#__PURE__*/React.createElement("button", {
-      key: b,
-      className: 'brand-btn' + (active ? ' brand-btn-active' : ''),
-      style: style,
-      onClick: () => onChange(active ? '' : b)
-    }, /*#__PURE__*/React.createElement("span", {
-      className: "brand-dot",
-      style: {
-        background: c
-      }
-    }), brandLabel(b));
-  }));
-}
 
-/* ---- Reusable revenue-over-time chart (Day/Month/Year + growth trend) */
-function linregTrend(pts) {
-  const n = pts.length;
-  if (n < 2) return pts.map(p => ({
-    ...p,
-    trend: p.value
-  }));
-  let sx = 0,
-    sy = 0,
-    sxy = 0,
-    sxx = 0;
-  pts.forEach((p, i) => {
-    sx += i;
-    sy += p.value;
-    sxy += i * p.value;
-    sxx += i * i;
-  });
-  const den = n * sxx - sx * sx || 1;
-  const b = (n * sxy - sx * sy) / den,
-    a = (sy - b * sx) / n;
-  return pts.map((p, i) => ({
-    ...p,
-    trend: Math.max(0, a + b * i)
-  }));
-}
-function TimeSeriesChart({
-  title,
-  em,
-  data,
-  grouping,
-  setGrouping,
-  metricLabel
-}) {
-  const ml = metricLabel || 'Revenue';
-  const withTrend = linregTrend(data);
-  const first = data.length ? data[0].value : 0,
-    last = data.length ? data[data.length - 1].value : 0;
-  const growth = first ? (last - first) / first * 100 : null;
-  return /*#__PURE__*/React.createElement("section", {
-    className: "section"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "section-header"
-  }, /*#__PURE__*/React.createElement("h2", {
-    className: "section-title"
-  }, title, " ", em && /*#__PURE__*/React.createElement("em", null, em)), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 14
-    }
-  }, growth != null && /*#__PURE__*/React.createElement("span", {
-    className: "growth-badge",
-    style: {
-      color: growth >= 0 ? 'var(--accent)' : '#e2554f'
-    }
-  }, growth >= 0 ? '▲' : '▼', " ", Math.abs(growth).toFixed(1), "% ", /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: 'var(--text-faint)'
-    }
-  }, "trend")), /*#__PURE__*/React.createElement("div", {
-    className: "seg"
-  }, [['day', 'Day'], ['month', 'Month'], ['year', 'Year']].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
-    key: k,
-    className: 'seg-btn' + (grouping === k ? ' seg-active' : ''),
-    onClick: () => setGrouping(k)
-  }, l))))), /*#__PURE__*/React.createElement("div", {
-    className: "card",
-    style: {
-      height: 320
-    }
-  }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
-    width: "100%",
-    height: "100%"
-  }, /*#__PURE__*/React.createElement(ComposedChart, {
-    data: withTrend,
-    margin: {
-      top: 12,
-      right: 12,
-      left: 4,
-      bottom: 0
-    }
-  }, /*#__PURE__*/React.createElement("defs", null, /*#__PURE__*/React.createElement("linearGradient", {
-    id: "tsg",
-    x1: "0",
-    y1: "0",
-    x2: "0",
-    y2: "1"
-  }, /*#__PURE__*/React.createElement("stop", {
-    offset: "0%",
-    stopColor: "var(--accent)",
-    stopOpacity: 0.32
-  }), /*#__PURE__*/React.createElement("stop", {
-    offset: "100%",
-    stopColor: "var(--accent)",
-    stopOpacity: 0
-  }))), /*#__PURE__*/React.createElement(CartesianGrid, {
-    stroke: "var(--border-soft)",
-    strokeDasharray: "2 2",
-    vertical: false
-  }), /*#__PURE__*/React.createElement(XAxis, {
-    dataKey: "period",
-    stroke: "var(--text-faint)",
-    tick: {
-      fontSize: 11,
-      fontFamily: 'JetBrains Mono'
-    },
-    tickLine: false,
-    axisLine: {
-      stroke: 'var(--border)'
-    }
-  }), /*#__PURE__*/React.createElement(YAxis, {
-    stroke: "var(--text-faint)",
-    tick: {
-      fontSize: 11,
-      fontFamily: 'JetBrains Mono'
-    },
-    tickFormatter: fmtMoney,
-    tickLine: false,
-    axisLine: false
-  }), /*#__PURE__*/React.createElement(Tooltip, {
-    contentStyle: {
-      background: 'var(--bg-elev)',
-      border: '1px solid var(--border)',
-      borderRadius: 8,
-      fontSize: 12
-    },
-    formatter: (v, n) => [fmtMoneyFull(v), n === 'trend' ? 'Trend' : ml]
-  }), grouping === 'year' ? /*#__PURE__*/React.createElement(Bar, {
-    dataKey: "value",
-    name: ml,
-    radius: [3, 3, 0, 0]
-  }, withTrend.map((_, i) => /*#__PURE__*/React.createElement(Cell, {
-    key: i,
-    fill: SERIES_COLORS[i % SERIES_COLORS.length]
-  }))) : /*#__PURE__*/React.createElement(Area, {
-    type: "monotone",
-    dataKey: "value",
-    name: ml,
-    stroke: "var(--accent)",
-    strokeWidth: 2,
-    fill: "url(#tsg)"
-  }), /*#__PURE__*/React.createElement(Line, {
-    type: "monotone",
-    dataKey: "trend",
-    name: "trend",
-    stroke: "var(--warm)",
-    strokeWidth: 1.5,
-    strokeDasharray: "5 4",
-    dot: false
-  })))));
-}
+def pace_report():
+    print(f"Throttling: {_pace['calls']} requests, {_pace['throttled']} throttled, "
+          f"{_pace['slept']:.0f}s spent waiting, final gap {_pace['gap']:.2f}s")
 
-// Generic period grouping for a row set: returns [{period,value}] sorted.
-const groupByPeriod = (rows, grouping, valueOf) => {
-  const m = {};
-  rows.forEach(r => {
-    if (!r._date) return;
-    let k;
-    if (grouping === 'day') k = ymd(r._date);else if (grouping === 'year') k = String(r._date.getFullYear());else k = r._date.getFullYear() + '-' + String(r._date.getMonth() + 1).padStart(2, '0');
-    m[k] = (m[k] || 0) + valueOf(r);
-  });
-  return Object.entries(m).map(([period, value]) => ({
-    period,
-    value
-  })).sort((a, b) => a.period.localeCompare(b.period));
-};
 
-/* ---- Sticky footer: appears on scroll; brand quick-filters + dashboard nav */
-function StickyFooter({
-  nav,
-  active,
-  brands,
-  brand,
-  onBrand,
-  reps,
-  repValue,
-  onRep
-}) {
-  const [show, setShow] = useState(false);
-  useEffect(() => {
-    const onScroll = () => setShow(window.scrollY > 280);
-    window.addEventListener('scroll', onScroll, {
-      passive: true
-    });
-    onScroll();
-    return () => window.removeEventListener('scroll', onScroll);
-  }, []);
-  const list = (brands || []).filter(b => b !== '100 Shafer');
-  return /*#__PURE__*/React.createElement("nav", {
-    className: 'sticky-foot' + (show ? ' sticky-foot-show' : '')
-  }, onRep ? /*#__PURE__*/React.createElement("div", {
-    className: "sf-brands"
-  }, /*#__PURE__*/React.createElement("button", {
-    className: 'sf-brand sf-brand-all' + (repValue === '' ? ' sf-brand-active' : ''),
-    onClick: () => onRep('')
-  }, "All reps"), (reps || []).map(r => {
-    const on = repValue === r;
-    return /*#__PURE__*/React.createElement("button", {
-      key: r,
-      className: 'sf-brand' + (on ? ' sf-brand-active' : ''),
-      style: on ? {
-        background: 'var(--accent)',
-        borderColor: 'var(--accent)',
-        color: '#fff'
-      } : {
-        borderColor: 'var(--accent-dim)',
-        color: 'var(--text)'
-      },
-      onClick: () => onRep(on ? '' : r)
-    }, r);
-  })) : onBrand && list.length > 0 && /*#__PURE__*/React.createElement("div", {
-    className: "sf-brands"
-  }, /*#__PURE__*/React.createElement("button", {
-    className: 'sf-brand sf-brand-all' + (brand === '' ? ' sf-brand-active' : ''),
-    onClick: () => onBrand('')
-  }, "All"), list.map(b => {
-    const on = brand === b;
-    const c = brandColor(b);
-    return /*#__PURE__*/React.createElement("button", {
-      key: b,
-      className: 'sf-brand' + (on ? ' sf-brand-active' : ''),
-      title: brandLabel(b),
-      style: on ? {
-        background: c,
-        borderColor: c,
-        color: textOn(c)
-      } : {
-        borderColor: c,
-        color: 'var(--text)'
-      },
-      onClick: () => onBrand(on ? '' : b)
-    }, /*#__PURE__*/React.createElement("span", {
-      className: "sf-dot",
-      style: {
-        background: c
-      }
-    }), /*#__PURE__*/React.createElement("span", {
-      className: "sf-brand-label"
-    }, brandLabel(b)));
-  })), /*#__PURE__*/React.createElement("div", {
-    className: "sf-nav"
-  }, /*#__PURE__*/React.createElement("a", {
-    href: "https://medfarms.analyticshub.workers.dev/",
-    className: "bn-tab bn-back"
-  }, "← Back to main page")));
-}
+def _get(url, params):
+    # Robust GET: retry on 429 and transient 5xx so a single hiccup never
+    # silently truncates the pull.
+    last = None
+    for attempt in range(6):
+        _pace_wait()
+        try:
+            resp = requests.get(url, headers=auth_headers(), params=params, timeout=120)
+        except requests.RequestException as e:
+            last = e
+            wait = min(5 * (attempt + 1), 30)
+            time.sleep(wait)
+            _pace["slept"] += wait
+            continue
+        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+            _pace["throttled"] += 1
+            _pace["clean"] = 0
+            if resp.status_code == 429:
+                # Back off the steady-state pace, not just this one request.
+                _pace["gap"] = min(_pace["gap"] * 1.6 + 0.1, MAX_REQUEST_GAP)
+            wait = _retry_after(resp, min(5 * (attempt + 1), 30) + random.uniform(0, 1))
+            print(f"  {resp.status_code} — backing off {wait:.0f}s "
+                  f"(attempt {attempt+1}, pace now {_pace['gap']:.2f}s)")
+            time.sleep(wait)
+            _pace["slept"] += wait
+            last = resp
+            continue
+        # Clean run of responses — ease the pace back toward the floor.
+        _pace["clean"] += 1
+        if _pace["clean"] >= 25 and _pace["gap"] > MIN_REQUEST_GAP:
+            _pace["gap"] = max(MIN_REQUEST_GAP, _pace["gap"] * 0.8)
+            _pace["clean"] = 0
+        return resp
+    if isinstance(last, requests.Response):
+        return last
+    raise RuntimeError(f"request failed after retries: {last}")
 
-// Coarse product category derived from the product name (Apex/LeafLink category
-// fields are mostly blank or hyper-granular, so we classify into clean buckets).
-const categorize = r => {
-  const n = (String(r.product_name || '') + ' ' + String(r.product_category || r.product_type || r.product_line || '')).toLowerCase();
-  if (!n.trim()) return 'Other';
-  if (/stylus|vape|cart|disposable|510|\bpod/.test(n)) return 'Vape';
-  if (/pre-?roll|\brolls?\b|cone|joint|blunt/.test(n)) return 'Pre-Roll';
-  if (/gummy|gummies|edible|chocolate|syrup|cookie|brownie|candy|beverage|drink|tincture/.test(n)) return 'Edible';
-  if (/resin|rosin|\bwax\b|badder|budder|shatter|diamond|sauce|hash|concentrate|\bdab/.test(n)) return 'Concentrate';
-  if (/flower|\bbud\b|eighth|ounce|\boz\b|smalls|shake|popcorn/.test(n)) return 'Flower';
-  if (/topical|\brubs?\b|balm|salve|lotion|cream/.test(n)) return 'Topical';
-  return 'Other';
-};
 
-/* ---- Pagination ----------------------------------------------------- */
-function usePager(items, perPage) {
-  const [page, setPage] = useState(0);
-  const pp = perPage || 15;
-  const pages = Math.max(1, Math.ceil(items.length / pp));
-  const p = Math.min(page, pages - 1);
-  useEffect(() => {
-    if (page > pages - 1) setPage(0);
-  }, [items.length]);
-  return {
-    slice: items.slice(p * pp, p * pp + pp),
-    page: p,
-    pages,
-    setPage,
-    total: items.length,
-    perPage: pp
-  };
-}
-function Pager({
-  pager
-}) {
-  const {
-    page,
-    pages,
-    setPage,
-    total,
-    perPage
-  } = pager;
-  if (pages <= 1) return null;
-  return /*#__PURE__*/React.createElement("div", {
-    className: "pager"
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "pager-btn",
-    disabled: page === 0,
-    onClick: () => setPage(page - 1)
-  }, "‹ Prev"), /*#__PURE__*/React.createElement("span", {
-    className: "pager-info"
-  }, total === 0 ? '0' : page * perPage + 1 + '–' + Math.min((page + 1) * perPage, total), " of ", fmtNum(total), " · page ", page + 1, "/", pages), /*#__PURE__*/React.createElement("button", {
-    className: "pager-btn",
-    disabled: page >= pages - 1,
-    onClick: () => setPage(page + 1)
-  }, "Next ›"));
-}
+def _month_windows(from_date, to_date):
+    """Yield (gte, lt) date-string pairs, one calendar month each, covering the
+    range. Windowing keeps every request well under LeafLink's ~6,050-result
+    pagination ceiling, so the full history is retrievable."""
+    y, m = int(from_date[:4]), int(from_date[5:7])
+    windows = []
+    while True:
+        start = f"{y:04d}-{m:02d}-01"
+        ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+        nxt = f"{ny:04d}-{nm:02d}-01"
+        windows.append((start, nxt))
+        if start[:7] >= to_date[:7]:
+            break
+        y, m = ny, nm
+    return windows
 
-/* =====================================================================
-   INVENTORY DASHBOARD  (uses data.inventory array)
-   ===================================================================== */
-const NAV = [{
-  key: 'sales',
-  label: 'Sales',
-  href: 'https://maeann-png.github.io/michigan-mutibrand-sales/'
-}, {
-  key: 'ar',
-  label: 'Receivables',
-  href: 'https://maeann-png.github.io/michigan-multibrand-ar/'
-}, {
-  key: 'inventory',
-  label: 'Inventory',
-  href: 'https://maeann-png.github.io/michigan-multibrand-inventory/'
-}, {
-  key: 'rep',
-  label: 'By Rep',
-  href: 'https://maeann-png.github.io/michigan-multibrand-rep/'
-}];
-const ACTIVE = 'inventory';
 
-// Inventory rows carry no price. Dollar values are derived per-SKU from the
-// sales rows in the same payload — see `pricing` in InventoryDashboard.
-//
-// The old blanket `AVG_UNIT_PRICE = 56.05` overstated on-hand value by ~6.9x
-// ($23.2M vs $3.38M). It conflated two different units: inventory counts are
-// individual units ("eaches"), but $56.05 was closer to a per-CASE figure.
-// In the sales rows: quantity = units_sold x unit_multiplier, so `quantity` is
-// eaches and `units_sold` is cases. Inventory `inventory` matches the eaches
-// basis, so $/unit must be revenue / quantity.
+def _fetch_window(gte, lt):
+    """Page through one date window completely, following `next`."""
+    params = {"page_size": PAGE_SIZE, "page": 1,
+              "created_on__gte": gte, "created_on__lt": lt,
+              "ordering": "created_on"}
+    if INCLUDE_CHILDREN:
+        params["include_children"] = INCLUDE_CHILDREN
+    url = f"{API_BASE}{ENDPOINT}"
+    out, page, reported = [], 0, None
+    resp = _get(url, params)
+    if resp.status_code == 400:
+        # Date filter rejected — surface clearly rather than silently mis-pulling.
+        print(f"ERROR 400 on window {gte}..{lt}: {resp.text[:200]}")
+        sys.exit(1)
+    if resp.status_code == 401:
+        print("ERROR: 401 Unauthorized — key missing/wrong/revoked."); sys.exit(1)
+    if resp.status_code == 403:
+        print("ERROR: 403 Forbidden — app lacks Orders read permission."); sys.exit(1)
+    if resp.status_code != 200:
+        print(f"ERROR: status {resp.status_code}\n{resp.text[:300]}"); sys.exit(1)
+    while True:
+        data = resp.json()
+        if reported is None:
+            reported = data.get("count")
+        batch = data.get("results", data if isinstance(data, list) else [])
+        out.extend(batch)
+        page += 1
+        nxt = data.get("next") if isinstance(data, dict) else None
+        if not nxt or (MAX_PAGES and page >= MAX_PAGES):
+            break
+        resp = _get(nxt, None)
+        if resp.status_code != 200:
+            # Don't return a half window — fail loudly so partial data is never committed.
+            print(f"ERROR: window {gte}..{lt} page fetch returned {resp.status_code}; aborting.")
+            sys.exit(1)
+    # If a single month ever exceeds the cap, warn (would need finer windows).
+    if reported and len(out) < reported:
+        print(f"  WARNING: window {gte}..{lt} returned {len(out)} of {reported} "
+              "(month exceeds pagination cap — needs finer windows).")
+    return out, reported
 
-// Covert Cups' electric yellow (#eaf031) is unreadable on the light lavender
-// theme. Darken it here only — the Sales / AR / Rep dashboards still use the
-// original hue, so this is a mutation rather than a redeclaration of the
-// BRAND_COLORS const that common.jsx already defines in this same scope.
-BRAND_COLORS['Covert Cups'] = '#c99e0a';
-function BottomNav() {
-  return /*#__PURE__*/React.createElement("nav", {
-    className: "bottom-nav"
-  }, NAV.map(n => /*#__PURE__*/React.createElement("a", {
-    key: n.key,
-    href: n.href,
-    className: 'bn-tab' + (n.key === ACTIVE ? ' bn-active' : '')
-  }, n.label)));
-}
-function App() {
-  const {
-    data,
-    error
-  } = useData(DATA_URL);
-  const [filters, setFilters] = useState({
-    brand: '',
-    status: '',
-    search: []
-  });
-  if (error) return /*#__PURE__*/React.createElement("div", {
-    className: "app"
-  }, /*#__PURE__*/React.createElement(Empty, {
-    title: "No data yet"
-  }, /*#__PURE__*/React.createElement("p", null, "Run the scraper to produce ", /*#__PURE__*/React.createElement("code", null, "sales_data.json.gz"), "."), /*#__PURE__*/React.createElement("p", {
-    style: {
-      marginTop: 10,
-      fontSize: 12,
-      color: 'var(--text-faint)'
-    }
-  }, error)));
-  if (!data) return /*#__PURE__*/React.createElement("div", {
-    className: "app"
-  }, /*#__PURE__*/React.createElement(Spinner, null));
-  return /*#__PURE__*/React.createElement(InventoryDashboard, {
-    data: data,
-    filters: filters,
-    setFilters: setFilters
-  });
-}
-function InventoryDashboard({
-  data,
-  filters,
-  setFilters
-}) {
-  const [invMetric, setInvMetric] = useState('onhand');
-  // Independent brand narrowing, scoped to a single table each.
-  const [prodBrand, setProdBrand] = useState('');
-  const [oosBrand, setOosBrand] = useState('');
-  const raw = data.inventory || [];
-  const asOf = useMemo(() => data.fetched_at ? new Date(data.fetched_at) : new Date(), [data]);
 
-  // Real $/unit per SKU, from actual sales: revenue / quantity (quantity = eaches).
-  // Samples are excluded so $0 giveaways don't drag the average down.
-  // Fallback chain: SKU price -> that brand's average -> overall average.
-  // Averages are computed only over SKUs we actually stock, so unrelated
-  // third-party brands in `rows` can't skew the fallback.
-  const pricing = useMemo(() => {
-    const brandOf = {};
-    raw.forEach(i => {
-      if (i.sku) brandOf[i.sku] = i.brand || '—';
-    });
-    const rev = {},
-      qty = {},
-      bRev = {},
-      bQty = {};
-    let gRev = 0,
-      gQty = 0;
-    (data.rows || []).forEach(r => {
-      if (r.is_sample) return;
-      const s = r.product_sku;
-      if (!s || !(s in brandOf)) return;
-      const rv = +r.revenue || 0;
-      const q = +r.quantity || 0;
-      if (q <= 0) return;
-      rev[s] = (rev[s] || 0) + rv;
-      qty[s] = (qty[s] || 0) + q;
-      const b = brandOf[s];
-      bRev[b] = (bRev[b] || 0) + rv;
-      bQty[b] = (bQty[b] || 0) + q;
-      gRev += rv;
-      gQty += q;
-    });
-    const bySku = {};
-    Object.keys(rev).forEach(s => {
-      if (qty[s] > 0) bySku[s] = rev[s] / qty[s];
-    });
-    const byBrand = {};
-    Object.keys(bRev).forEach(b => {
-      if (bQty[b] > 0) byBrand[b] = bRev[b] / bQty[b];
-    });
-    return {
-      bySku,
-      byBrand,
-      global: gQty > 0 ? gRev / gQty : 0
-    };
-  }, [raw, data]);
+def fetch_all(start_override: str = "") -> list:
+    if not API_KEY:
+        print("ERROR: LEAFLINK_API_KEY is empty.")
+        sys.exit(1)
+    today = datetime.now().strftime("%Y-%m-%d")
+    start = start_override or FROM_DATE or "2020-01-01"
+    windows = _month_windows(start, today)
+    print(f"Pulling {len(windows)} monthly windows ({start} .. {today})")
+    seen, orders = set(), []
+    for gte, lt in windows:
+        batch, reported = _fetch_window(gte, lt)
+        new = 0
+        for o in batch:
+            key = o.get("number") or o.get("id")
+            if key in seen:
+                continue
+            seen.add(key)
+            orders.append(o)
+            new += 1
+        print(f"  {gte} -> {lt}: {len(batch)} fetched ({new} new) | total {len(orders)}")
+    return orders
 
-  // Case configuration + product line per SKU. The inventory feed doesn't carry
-  // any of this, but the order lines do: unit_multiplier = units per case,
-  // unit_price = wholesale price for that case, product_line = the grouping used
-  // on the allocation sheet. Case packs get re-cut over time, so take the most
-  // recent order line for each SKU rather than the first.
-  const caseInfo = useMemo(() => {
-    const have = {};
-    raw.forEach(i => {
-      if (i.sku) have[i.sku] = 1;
-    });
-    const packs = {},
-      lines = {};
-    (data.rows || []).forEach(r => {
-      const s = r.product_sku;
-      if (!s || !have[s]) return;
-      const d = r.order_date || '';
-      const per = +r.unit_multiplier || 0;
-      if (per > 0 && (!packs[s] || d >= packs[s].d)) packs[s] = { d: d, per: per, casePrice: +r.unit_price || 0 };
-      const ln = String(r.product_line || '').trim();
-      if (ln && (!lines[s] || d >= lines[s].d)) lines[s] = { d: d, ln: ln };
-    });
-    const out = {};
-    Object.keys(have).forEach(s => {
-      const pk = packs[s];
-      out[s] = {
-        line: lines[s] ? lines[s].ln : '',
-        unitsPerCase: pk ? pk.per : 0,
-        casePrice: pk ? pk.casePrice : 0
-      };
-    });
-    return out;
-  }, [raw, data]);
-  const items = useMemo(() => raw.map(p => {
-    const onHand = +p.inventory || 0;
-    const reserved = +p.reserved || 0;
-    const available = p.available != null ? +p.available || 0 : p.avail != null ? +p.avail || 0 : onHand - reserved;
-    const brand = p.brand || '—';
-    const price = pricing.bySku[p.sku] != null ? pricing.bySku[p.sku] : pricing.byBrand[brand] != null ? pricing.byBrand[brand] : pricing.global;
-    const ci = caseInfo[p.sku] || {};
-    // The inventory feed wins when it carries case config and a product line
-    // (the LeafLink CSV export path supplies both). The order-history
-    // derivation is only a fallback: it reads the last sale, so a discounted
-    // or sample line can put the case price below list.
-    const per = +p.units_per_case || ci.unitsPerCase || 0;
-    const casePrice = +p.case_price || ci.casePrice || 0;
-    const listed = String(p.status || '').trim();
-    return {
-      id: p.id,
-      sku: p.sku,
-      name: p.name || '—',
-      line: String(p.line || '').trim() || ci.line || 'Unassigned',
-      status: listed || '—',
-      listed,
-      // Anything not plainly "Available" gets flagged in the table.
-      offMarket: !!listed && listed.toLowerCase() !== 'available',
-      brand,
-      unitsPerCase: per,
-      casePrice,
-      unitPrice: per > 0 ? casePrice / per : 0,
-      availCasesExact: per > 0 ? available / per : 0,
-      availCasesFull: per > 0 ? Math.floor(available / per) : 0,
-      onHand,
-      reserved,
-      available,
-      price,
-      onHandValue: onHand * price,
-      reservedValue: reserved * price,
-      availableValue: available * price
-    };
-  }), [raw, pricing, caseInfo]);
-  const distinct = useMemo(() => ({
-    brands: PRIMARY_BRANDS.filter(b => items.some(p => p.brand === b)),
-    statuses: [...new Set(items.map(p => p.status).filter(Boolean))].sort()
-  }), [items]);
 
-  // Type-ahead suggestions for the search box, tagged by field.
-  const searchOptions = useMemo(() => {
-    const seen = {},
-      out = [];
-    const push = (v, t) => {
-      v = String(v == null ? '' : v).trim();
-      if (!v) return;
-      const k = t + '|' + v.toLowerCase();
-      if (seen[k]) return;
-      seen[k] = 1;
-      out.push({ v: v, t: t });
-    };
-    items.forEach(p => {
-      push(p.name, 'product');
-      push(p.sku, 'sku');
-      push(brandLabel(p.brand), 'brand');
-    });
-    return out;
-  }, [items]);
-  const filtered = useMemo(() => items.filter(p => {
-    if (filters.brand && p.brand !== filters.brand) return false;
-    if (filters.status === 'Reserved') {
-      if (p.reserved <= 0) return false;
-    } else if (filters.status && p.status !== filters.status) return false;
-    if (!matchesSearch(filters.search, p.name + ' ' + p.sku + ' ' + p.brand)) return false;
-    return true;
-  }), [items, filters]);
-  const kpis = useMemo(() => {
-    const onHand = filtered.reduce((s, p) => s + p.onHand, 0);
-    const reserved = filtered.reduce((s, p) => s + p.reserved, 0);
-    const available = filtered.reduce((s, p) => s + p.available, 0);
-    const onHandValue = filtered.reduce((s, p) => s + p.onHandValue, 0);
-    const reservedValue = filtered.reduce((s, p) => s + p.reservedValue, 0);
-    const availableValue = filtered.reduce((s, p) => s + p.availableValue, 0);
-    const oos = filtered.filter(p => p.available <= 0).length;
-    return {
-      onHand,
-      reserved,
-      available,
-      onHandValue,
-      reservedValue,
-      availableValue,
-      oos,
-      skus: filtered.length
-    };
-  }, [filtered]);
+# ----------------------------------------------------------------------------
+def _first(d, *keys):
+    for k in keys:
+        if isinstance(d, dict) and d.get(k) not in (None, "", []):
+            return d.get(k)
+    return None
 
-  // Out-of-stock products (zero on hand) — respects brand + search, ignores the stock dropdown
-  const oosItems = useMemo(() => items.filter(p => {
-    if (p.available > 0) return false;
-    if (filters.brand && p.brand !== filters.brand) return false;
-    if (oosBrand && p.brand !== oosBrand) return false;
-    if (!matchesSearch(filters.search, p.name + ' ' + p.sku + ' ' + p.brand)) return false;
-    return true;
-  }).sort((a, b) => brandLabel(a.brand).localeCompare(brandLabel(b.brand)) || a.line.localeCompare(b.line) || a.name.localeCompare(b.name)), [items, filters.brand, filters.search, oosBrand]);
 
-  // Brands that actually have something out of stock — no point offering
-  // a dropdown option that always yields an empty table.
-  const oosBrands = useMemo(() => {
-    const s = new Set(items.filter(p => p.available <= 0).map(p => p.brand));
-    return PRIMARY_BRANDS.filter(b => s.has(b));
-  }, [items]);
-  const byBrand = useMemo(() => {
-    const m = {};
-    filtered.forEach(p => {
-      if (!m[p.brand]) m[p.brand] = {
-        name: p.brand,
-        onHand: 0,
-        reserved: 0,
-        available: 0,
-        skus: 0,
-        onHandValue: 0,
-        reservedValue: 0,
-        availableValue: 0
-      };
-      m[p.brand].onHand += p.onHand;
-      m[p.brand].reserved += p.reserved;
-      m[p.brand].available += p.available;
-      m[p.brand].skus += 1;
-      m[p.brand].onHandValue += p.onHandValue;
-      m[p.brand].reservedValue += p.reservedValue;
-      m[p.brand].availableValue += p.availableValue;
-    });
-    return Object.values(m).sort((a, b) => b.onHand - a.onHand);
-  }, [filtered]);
-  const reset = () => {
-    setFilters({
-      brand: '',
-      status: '',
-      search: []
-    });
-    setProdBrand('');
-    setOosBrand('');
-  };
-  const upd = (k, v) => setFilters(f => ({
-    ...f,
-    [k]: v
-  }));
-  if (!raw.length) {
-    return /*#__PURE__*/React.createElement("div", {
-      className: "app",
-      style: {
-        paddingBottom: 110
-      }
-    }, /*#__PURE__*/React.createElement(Topbar, {
-      section: "Inventory",
-      fetchedAt: asOf
-    }), /*#__PURE__*/React.createElement(Empty, {
-      title: "No inventory loaded yet"
-    }, /*#__PURE__*/React.createElement("p", null, "The scraper hasn’t populated the ", /*#__PURE__*/React.createElement("code", null, "inventory"), " array. Run it with ", /*#__PURE__*/React.createElement("code", null, "LEAFLINK_PULL_INVENTORY=1"), ".")), /*#__PURE__*/React.createElement(StickyFooter, {
-      nav: NAV,
-      active: ACTIVE,
-      brands: distinct.brands,
-      brand: filters.brand,
-      onBrand: b => upd('brand', b)
-    }));
-  }
-  return /*#__PURE__*/React.createElement("div", {
-    className: "app",
-    style: {
-      paddingBottom: 110
-    }
-  }, /*#__PURE__*/React.createElement(Topbar, {
-    section: "Inventory",
-    fetchedAt: asOf,
-    right: /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("strong", null, fmtNum(kpis.skus)), " SKUs")
-  }), /*#__PURE__*/React.createElement(BrandButtons, {
-    brands: distinct.brands,
-    value: filters.brand,
-    onChange: b => upd('brand', b)
-  }), /*#__PURE__*/React.createElement("div", {
-    className: "filters"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "filter-group",
-    style: {
-      minWidth: 300,
-      flex: '1 1 300px'
-    }
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "filter-label"
-  }, "Search"), /*#__PURE__*/React.createElement(SearchBox, {
-    terms: filters.search,
-    onChange: v => upd('search', v),
-    options: searchOptions,
-    placeholder: "product / sku / brand…"
-  })), /*#__PURE__*/React.createElement("button", {
-    className: "filter-reset filter-reset-lg",
-    onClick: reset
-  }, "Reset")), /*#__PURE__*/React.createElement("div", {
-    className: "kpi-grid"
-  }, /*#__PURE__*/React.createElement(Kpi, {
-    label: "Units On Hand",
-    value: fmtNum(kpis.onHand),
-    sub: fmtNum(kpis.skus) + ' SKUs · ' + fmtMoney(kpis.onHandValue),
-    accent: true
-  }), /*#__PURE__*/React.createElement(Kpi, {
-    label: "Reserved",
-    value: fmtNum(kpis.reserved),
-    sub: 'committed to orders · ' + fmtMoney(kpis.reservedValue)
-  }), /*#__PURE__*/React.createElement(Kpi, {
-    label: "Available",
-    value: fmtNum(kpis.available),
-    sub: 'on hand − reserved · ' + fmtMoney(kpis.availableValue)
-  }), /*#__PURE__*/React.createElement(Kpi, {
-    label: "Out of Stock",
-    value: fmtNum(kpis.oos),
-    sub: "SKUs · 0 available",
-    color: kpis.oos ? 'var(--rose)' : null
-  })), /*#__PURE__*/React.createElement("section", {
-    className: "section"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "section-header"
-  }, /*#__PURE__*/React.createElement("h2", {
-    className: "section-title"
-  }, invMetric === 'reserved' ? 'Reserved' : invMetric === 'available' ? 'Available' : 'On hand', " ", /*#__PURE__*/React.createElement("em", null, "by brand")), /*#__PURE__*/React.createElement("div", {
-    className: "seg"
-  }, [['onhand', 'On hand'], ['available', 'Available'], ['reserved', 'Reserved']].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
-    key: k,
-    className: 'seg-btn' + (invMetric === k ? ' seg-active' : ''),
-    onClick: () => setInvMetric(k)
-  }, l)))), /*#__PURE__*/React.createElement("div", {
-    className: "card",
-    style: {
-      height: 300
-    }
-  }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
-    width: "100%",
-    height: "100%"
-  }, /*#__PURE__*/React.createElement(BarChart, {
-    data: invMetric === 'onhand' ? byBrand : byBrand.slice().sort((a, b) => b[invMetric] - a[invMetric]),
-    margin: {
-      top: 12,
-      right: 12,
-      left: 4,
-      bottom: 0
-    }
-  }, /*#__PURE__*/React.createElement(CartesianGrid, {
-    stroke: "var(--border-soft)",
-    strokeDasharray: "2 2",
-    vertical: false
-  }), /*#__PURE__*/React.createElement(XAxis, {
-    dataKey: "name",
-    stroke: "var(--text-faint)",
-    tick: {
-      fontSize: 11
-    },
-    axisLine: {
-      stroke: 'var(--border)'
-    },
-    tickLine: false
-  }), /*#__PURE__*/React.createElement(YAxis, {
-    stroke: "var(--text-faint)",
-    tick: {
-      fontSize: 11,
-      fontFamily: 'JetBrains Mono'
-    },
-    tickFormatter: fmtNum,
-    axisLine: false,
-    tickLine: false
-  }), /*#__PURE__*/React.createElement(Tooltip, {
-    contentStyle: {
-      background: 'var(--bg-elev)',
-      border: '1px solid var(--border)',
-      borderRadius: 8,
-      fontSize: 12
-    },
-    formatter: (v, n) => [fmtNum(v), n]
-  }), /*#__PURE__*/React.createElement(Legend, {
-    wrapperStyle: {
-      fontSize: 11,
-      fontFamily: 'JetBrains Mono'
-    }
-  }), invMetric === 'onhand' ? [/*#__PURE__*/React.createElement(Bar, {
-    key: "a",
-    dataKey: "available",
-    name: "Available",
-    stackId: "a",
-    fill: filters.brand ? brandColor(filters.brand) : 'var(--accent)'
-  }, byBrand.map((d, i) => /*#__PURE__*/React.createElement(Cell, {
-    key: i,
-    fill: brandColor(d.name)
-  }))), /*#__PURE__*/React.createElement(Bar, {
-    key: "r",
-    dataKey: "reserved",
-    name: "Reserved",
-    stackId: "a",
-    fill: "var(--text-faint)",
-    radius: [3, 3, 0, 0]
-  }, /*#__PURE__*/React.createElement(Recharts.LabelList, {
-    dataKey: "onHand",
-    position: "top",
-    formatter: fmtNum,
-    style: {
-      fontSize: 10,
-      fill: 'var(--text-dim)',
-      fontFamily: 'JetBrains Mono'
-    }
-  }))] : /*#__PURE__*/React.createElement(Bar, {
-    dataKey: invMetric,
-    name: invMetric === 'reserved' ? 'Reserved' : 'Available',
-    radius: [3, 3, 0, 0],
-    fill: filters.brand ? brandColor(filters.brand) : 'var(--accent)'
-  }, byBrand.map((d, i) => /*#__PURE__*/React.createElement(Cell, {
-    key: i,
-    fill: brandColor(d.name)
-  })), /*#__PURE__*/React.createElement(Recharts.LabelList, {
-    dataKey: invMetric,
-    position: "top",
-    formatter: fmtNum,
-    style: {
-      fontSize: 10,
-      fill: 'var(--text-dim)',
-      fontFamily: 'JetBrains Mono'
-    }
-  }))))), /*#__PURE__*/React.createElement("div", {
-    className: "brand-cards",
-    style: {
-      display: 'grid',
-      gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-      gap: 14,
-      marginTop: 16
-    }
-  }, byBrand.map((b, i) => /*#__PURE__*/React.createElement("div", {
-    key: i,
-    className: "card",
-    style: {
-      padding: 18,
-      borderTop: '3px solid ' + brandColor(b.name)
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      justifyContent: 'space-between',
-      alignItems: 'baseline',
-      marginBottom: 12
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: Object.assign({
-      fontWeight: 600
-    }, brandTag(b.name))
-  }, brandLabel(b.name)), /*#__PURE__*/React.createElement("span", {
-    className: "kpi-sub"
-  }, fmtNum(b.skus), " SKUs")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      justifyContent: 'space-between',
-      alignItems: 'baseline',
-      padding: '5px 0'
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "kpi-sub"
-  }, "On hand"), /*#__PURE__*/React.createElement("span", {
-    style: {
-      textAlign: 'right'
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "font-mono",
-    style: {
-      fontWeight: 600,
-      color: 'var(--text)'
-    }
-  }, fmtNum(b.onHand)), /*#__PURE__*/React.createElement("span", {
-    className: "kpi-sub font-mono",
-    style: {
-      display: 'block',
-      fontSize: 10
-    }
-  }, fmtMoney(b.onHandValue)))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      justifyContent: 'space-between',
-      alignItems: 'baseline',
-      padding: '5px 0'
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "kpi-sub"
-  }, "Reserved"), /*#__PURE__*/React.createElement("span", {
-    style: {
-      textAlign: 'right'
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "font-mono",
-    style: {
-      color: 'var(--text-dim)'
-    }
-  }, fmtNum(b.reserved)), /*#__PURE__*/React.createElement("span", {
-    className: "kpi-sub font-mono",
-    style: {
-      display: 'block',
-      fontSize: 10
-    }
-  }, fmtMoney(b.reservedValue)))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      justifyContent: 'space-between',
-      alignItems: 'baseline',
-      padding: '5px 0',
-      borderTop: '1px solid var(--border-soft)'
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "kpi-sub"
-  }, "Available"), /*#__PURE__*/React.createElement("span", {
-    style: {
-      textAlign: 'right'
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "font-mono",
-    style: {
-      fontWeight: 600,
-      color: brandInk(b.name)
-    }
-  }, fmtNum(b.available)), /*#__PURE__*/React.createElement("span", {
-    className: "kpi-sub font-mono",
-    style: {
-      display: 'block',
-      fontSize: 10
-    }
-  }, fmtMoney(b.availableValue)))))))), (() => {
-    const mk = invMetric === 'reserved' ? 'reserved' : invMetric === 'available' ? 'available' : 'onHand';
-    // "In stock" = something a buyer can actually order (available > 0).
-    // Sold-through SKUs (units on hand but all reserved) are excluded here
-    // and surface in the Out-of-stock table below, so the two never overlap.
-    const tableRows = filtered.filter(p => p.available > 0).filter(p => !prodBrand || p.brand === prodBrand).filter(p => invMetric === 'onhand' ? true : p[mk] > 0);
-    // Allocation-sheet arrangement: brand, then product line, then product name,
-    // with a header row introducing each group.
-    const ordered = tableRows.slice().sort((a, b) => brandLabel(a.brand).localeCompare(brandLabel(b.brand)) || a.line.localeCompare(b.line) || a.name.localeCompare(b.name));
-    const dash = '\u2014';
-    const cases = n => {
-      const r = Math.round(n * 100) / 100;
-      return r.toLocaleString(undefined, { maximumFractionDigits: 2 });
-    };
-    const body = [];
-    let curBrand = null,
-      curLine = null;
-    ordered.forEach((p, i) => {
-      if (p.brand !== curBrand) {
-        curBrand = p.brand;
-        curLine = null;
-        body.push(/*#__PURE__*/React.createElement("tr", {
-          key: 'b' + i,
-          className: "grp-brand"
-        }, /*#__PURE__*/React.createElement("td", {
-          colSpan: 9
-        }, /*#__PURE__*/React.createElement("span", {
-          className: "chip",
-          style: brandChip(p.brand)
-        }, brandLabel(p.brand)))));
-      }
-      if (p.line !== curLine) {
-        curLine = p.line;
-        body.push(/*#__PURE__*/React.createElement("tr", {
-          key: 'l' + i,
-          className: "grp-line"
-        }, /*#__PURE__*/React.createElement("td", {
-          colSpan: 9
-        }, p.line)));
-      }
-      const per = p.unitsPerCase;
-      body.push(/*#__PURE__*/React.createElement("tr", {
-        key: 'p' + i
-      }, /*#__PURE__*/React.createElement("td", null, p.name, p.offMarket && /*#__PURE__*/React.createElement("span", {
-        className: "state-tag",
-        title: "Listing state: " + p.status
-      }, p.status)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
-        style: brandTag(p.brand)
-      }, brandLabel(p.brand))), /*#__PURE__*/React.createElement("td", {
-        className: "dim"
-      }, p.line), /*#__PURE__*/React.createElement("td", {
-        className: "num"
-      }, per ? fmtNum(per) : dash), /*#__PURE__*/React.createElement("td", {
-        className: "num dim"
-      }, per ? fmtMoneyFull(p.casePrice) : dash), /*#__PURE__*/React.createElement("td", {
-        className: "num dim"
-      }, per ? fmtMoneyFull(p.unitPrice) : dash), /*#__PURE__*/React.createElement("td", {
-        className: "num"
-      }, per ? cases(p.availCasesExact) : dash), /*#__PURE__*/React.createElement("td", {
-        className: "num"
-      }, /*#__PURE__*/React.createElement("strong", null, per ? fmtNum(p.availCasesFull) : dash)), /*#__PURE__*/React.createElement("td", {
-        className: "num"
-      }, /*#__PURE__*/React.createElement("strong", null, per ? fmtNum(p.availCasesFull) : dash))));
-    });
-    return /*#__PURE__*/React.createElement("section", {
-      className: "section"
-    }, /*#__PURE__*/React.createElement("div", {
-      className: "section-header"
-    }, /*#__PURE__*/React.createElement("h2", {
-      className: "section-title"
-    }, "Product ", /*#__PURE__*/React.createElement("em", null, "inventory")), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: 'flex',
-        alignItems: 'center',
-        gap: 12
-      }
-    }, /*#__PURE__*/React.createElement("span", {
-      className: "section-meta"
-    }, fmtNum(ordered.length), " SKUs in stock", invMetric !== 'onhand' ? ' \u00b7 ' + (invMetric === 'reserved' ? 'reserved' : 'available') : ''), /*#__PURE__*/React.createElement("select", {
-      className: "filter-select",
-      style: {
-        minWidth: 150
-      },
-      value: prodBrand,
-      onChange: e => setProdBrand(e.target.value)
-    }, /*#__PURE__*/React.createElement("option", {
-      value: ""
-    }, "All brands"), distinct.brands.map(b => /*#__PURE__*/React.createElement("option", {
-      key: b,
-      value: b
-    }, brandLabel(b))))), /*#__PURE__*/React.createElement(DownloadBtn, {
-      onClick: () => exportCSV('inventory.csv', [
-        { key: 'name', label: 'Product Name' },
-        { key: o => brandLabel(o.brand), label: 'Brand' },
-        { key: 'line', label: 'Product Line' },
-        { key: 'unitsPerCase', label: 'Units Per Case', fmt: v => (+v || 0) },
-        { key: 'casePrice', label: 'Wholesale Price / Case', fmt: v => (+v || 0).toFixed(2) },
-        { key: 'unitPrice', label: 'Price Per Unit', fmt: v => (+v || 0).toFixed(2) },
-        { key: 'availCasesExact', label: 'Avail. Cases (Exact)', fmt: v => (Math.round((+v || 0) * 100) / 100) },
-        { key: 'availCasesFull', label: 'Avail. Full Cases', fmt: v => (+v || 0) },
-        { key: 'availCasesFull', label: 'Remaining Cases Available', fmt: v => (+v || 0) }
-      ], ordered)
-    })), /*#__PURE__*/React.createElement("div", {
-      className: "card",
-      style: {
-        padding: 0,
-        overflow: 'hidden'
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        overflowX: 'auto',
-        maxHeight: 620
-      }
-    }, /*#__PURE__*/React.createElement("table", {
-      className: "data-table"
-    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Product Name"), /*#__PURE__*/React.createElement("th", null, "Brand"), /*#__PURE__*/React.createElement("th", null, "Product Line"), /*#__PURE__*/React.createElement("th", {
-      className: "num"
-    }, "Units Per Case"), /*#__PURE__*/React.createElement("th", {
-      className: "num"
-    }, "Wholesale / Case"), /*#__PURE__*/React.createElement("th", {
-      className: "num"
-    }, "Price Per Unit"), /*#__PURE__*/React.createElement("th", {
-      className: "num"
-    }, "Avail. Cases (Exact)"), /*#__PURE__*/React.createElement("th", {
-      className: "num"
-    }, "Avail. Full Cases"), /*#__PURE__*/React.createElement("th", {
-      className: "num"
-    }, "Remaining Cases"))), /*#__PURE__*/React.createElement("tbody", null, body)))));
-  })(), /*#__PURE__*/React.createElement("section", {
-    className: "section"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "section-header"
-  }, /*#__PURE__*/React.createElement("h2", {
-    className: "section-title"
-  }, "Out of stock ", /*#__PURE__*/React.createElement("em", null, "products")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 12
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "section-meta"
-  }, fmtNum(oosItems.length), " SKUs · 0 available to order"), /*#__PURE__*/React.createElement("select", {
-    className: "filter-select",
-    style: {
-      minWidth: 150
-    },
-    value: oosBrand,
-    onChange: e => setOosBrand(e.target.value)
-  }, /*#__PURE__*/React.createElement("option", {
-    value: ""
-  }, "All brands"), oosBrands.map(b => /*#__PURE__*/React.createElement("option", {
-    key: b,
-    value: b
-  }, brandLabel(b)))))), /*#__PURE__*/React.createElement("div", {
-    className: "card",
-    style: {
-      padding: 0,
-      overflow: 'hidden'
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      overflowX: 'auto',
-      maxHeight: 480
-    }
-  }, /*#__PURE__*/React.createElement("table", {
-    className: "data-table"
-  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Product Name"), /*#__PURE__*/React.createElement("th", null, "Brand"), /*#__PURE__*/React.createElement("th", null, "Product Line"), /*#__PURE__*/React.createElement("th", {
-    className: "num"
-  }, "Units Per Case"), /*#__PURE__*/React.createElement("th", {
-    className: "num"
-  }, "Wholesale / Case"), /*#__PURE__*/React.createElement("th", {
-    className: "num"
-  }, "Price Per Unit"), /*#__PURE__*/React.createElement("th", {
-    className: "num"
-  }, "On Hand"), /*#__PURE__*/React.createElement("th", {
-    className: "num"
-  }, "Reserved"), /*#__PURE__*/React.createElement("th", {
-    className: "num"
-  }, "Available"))), /*#__PURE__*/React.createElement("tbody", null, (() => {
-    // Same brand -> product line grouping as the in-stock table above.
-    const out = [];
-    let cb = null,
-      cl = null;
-    const dash = '\u2014';
-    oosItems.forEach((p, i) => {
-      if (p.brand !== cb) {
-        cb = p.brand;
-        cl = null;
-        out.push(/*#__PURE__*/React.createElement("tr", {
-          key: 'b' + i,
-          className: "grp-brand"
-        }, /*#__PURE__*/React.createElement("td", {
-          colSpan: 9
-        }, /*#__PURE__*/React.createElement("span", {
-          className: "chip",
-          style: brandChip(p.brand)
-        }, brandLabel(p.brand)))));
-      }
-      if (p.line !== cl) {
-        cl = p.line;
-        out.push(/*#__PURE__*/React.createElement("tr", {
-          key: 'l' + i,
-          className: "grp-line"
-        }, /*#__PURE__*/React.createElement("td", {
-          colSpan: 9
-        }, p.line)));
-      }
-      const per = p.unitsPerCase;
-      out.push(/*#__PURE__*/React.createElement("tr", {
-        key: 'p' + i
-      }, /*#__PURE__*/React.createElement("td", null, p.name, p.offMarket && /*#__PURE__*/React.createElement("span", {
-        className: "state-tag",
-        title: "Listing state: " + p.status
-      }, p.status)), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
-        style: brandTag(p.brand)
-      }, brandLabel(p.brand))), /*#__PURE__*/React.createElement("td", {
-        className: "dim"
-      }, p.line), /*#__PURE__*/React.createElement("td", {
-        className: "num"
-      }, per ? fmtNum(per) : dash), /*#__PURE__*/React.createElement("td", {
-        className: "num dim"
-      }, per ? fmtMoneyFull(p.casePrice) : dash), /*#__PURE__*/React.createElement("td", {
-        className: "num dim"
-      }, per ? fmtMoneyFull(p.unitPrice) : dash), /*#__PURE__*/React.createElement("td", {
-        className: "num"
-      }, /*#__PURE__*/React.createElement("strong", null, fmtNum(p.onHand))), /*#__PURE__*/React.createElement("td", {
-        className: "num dim"
-      }, fmtNum(p.reserved)), /*#__PURE__*/React.createElement("td", {
-        className: "num",
-        style: {
-          color: 'var(--rose)'
+def _amount(v):
+    if isinstance(v, dict):
+        v = v.get("amount")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _name_of(v):
+    if isinstance(v, list):
+        return ", ".join(p for p in (_name_of(x) for x in v) if p)
+    if isinstance(v, dict):
+        return _first(v, "name", "title", "display_name", "full_name") or ""
+    if isinstance(v, str):
+        return v
+    return ""
+
+
+def _date_key(s):
+    if not s:
+        return None
+    s = str(s)
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    return None
+
+
+def _frozen_product(li):
+    fd = li.get("frozen_data")
+    prod = fd.get("product") if isinstance(fd, dict) else None
+    return prod if isinstance(prod, dict) else {}
+
+
+def _payment_status(o):
+    if o.get("paid"):
+        return "Paid"
+    due = _date_key(o.get("payment_due_date"))
+    today = datetime.now().strftime("%Y-%m-%d")
+    if due and due < today:
+        return "Overdue"
+    return "Unpaid"
+
+
+# --- Customer enrichment ----------------------------------------------------
+# LeafLink order payloads don't include the sales rep / buyer state. The
+# customers endpoint does (it's the seller's customer list). We pull it once,
+# build lookup maps keyed by customer id AND normalized buyer name, and stamp
+# each order. All best-effort + fail-safe: any failure leaves fields blank.
+
+def _person_name(v):
+    """Name of a rep/person. Handles dicts with full_name/name or first+last."""
+    if isinstance(v, list):
+        return ", ".join(p for p in (_person_name(x) for x in v) if p)
+    if isinstance(v, dict):
+        n = _first(v, "full_name", "name", "display_name", "title")
+        if n:
+            return n
+        fn = str(v.get("first_name") or "").strip()
+        ln = str(v.get("last_name") or "").strip()
+        combo = (fn + " " + ln).strip()
+        if combo:
+            return combo
+        return _first(v, "email", "username") or ""
+    if isinstance(v, str):
+        return v
+    return ""
+
+
+def _manager_ids(c):
+    """Assigned rep(s) on a customer = the `managers` field (list of user IDs).
+    Also tolerate a few alternate shapes / names."""
+    if not isinstance(c, dict):
+        return []
+    ids = []
+    for k in ("managers", "sales_reps", "assigned_sales_reps", "account_managers",
+              "sales_rep", "account_manager"):
+        v = c.get(k)
+        if v in (None, "", []):
+            continue
+        items = v if isinstance(v, list) else [v]
+        for x in items:
+            if isinstance(x, bool):
+                continue
+            if isinstance(x, int):
+                ids.append(str(x))
+            elif isinstance(x, dict):
+                xid = _first(x, "id", "pk", "user_id")
+                nm = _person_name(x)
+                ids.append(nm if nm else (str(xid) if xid is not None else ""))
+            elif isinstance(x, str) and x.strip():
+                ids.append(x.strip())
+    out, seen = [], set()
+    for i in ids:
+        if i and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def fetch_users():
+    """Build {user_id(str): name} by paging the users endpoint(s). {} on failure."""
+    if not API_KEY:
+        return {}
+    out = {}
+    for ep in USERS_ENDPOINTS:
+        url = f"{API_BASE}{ep}"
+        resp = _get(url, {"page_size": PAGE_SIZE, "page": 1})
+        if resp.status_code != 200:
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            continue
+        added = 0
+        while True:
+            batch = data.get("results", data if isinstance(data, list) else [])
+            for u in batch:
+                if not isinstance(u, dict):
+                    continue
+                uid = _first(u, "id", "pk", "user_id")
+                nm = _person_name(u)
+                if uid is not None and nm:
+                    out.setdefault(str(uid), nm)
+                    added += 1
+            nxt = data.get("next") if isinstance(data, dict) else None
+            if not nxt:
+                break
+            resp = _get(nxt, None)
+            if resp.status_code != 200:
+                break
+            try:
+                data = resp.json()
+            except Exception:
+                break
+        if added:
+            print(f"  resolved {added} user name(s) from {ep}")
+    return out
+
+
+def fetch_brands():
+    """Build {brand_id(str): name} by paging the brands endpoint(s). {} on failure."""
+    if not API_KEY:
+        return {}
+    out = {}
+    for ep in BRANDS_ENDPOINTS:
+        url = f"{API_BASE}{ep}"
+        resp = _get(url, {"page_size": PAGE_SIZE, "page": 1})
+        if resp.status_code != 200:
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            continue
+        added = 0
+        while True:
+            batch = data.get("results", data if isinstance(data, list) else [])
+            for b in batch:
+                if not isinstance(b, dict):
+                    continue
+                bid = _first(b, "id", "pk", "brand_id")
+                nm = _name_of(b)
+                if bid is not None and nm:
+                    out.setdefault(str(bid), nm)
+                    added += 1
+            nxt = data.get("next") if isinstance(data, dict) else None
+            if not nxt:
+                break
+            resp = _get(nxt, None)
+            if resp.status_code != 200:
+                break
+            try:
+                data = resp.json()
+            except Exception:
+                break
+        if added:
+            print(f"  resolved {added} brand name(s) from {ep}")
+            break
+    return out
+
+
+def _state_of(c):
+    if not isinstance(c, dict):
+        return ""
+    for k in ("state", "state_code", "region"):
+        v = c.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for k in ("buyer", "company", "address", "billing_address", "shipping_address",
+              "default_address", "location"):
+        sub = c.get(k)
+        if isinstance(sub, dict):
+            for kk in ("state", "state_code", "region"):
+                v = sub.get(kk)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return ""
+
+
+def _license_of(c):
+    if not isinstance(c, dict):
+        return ""
+    for k in ("license", "license_number", "license_no"):
+        v = c.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for sk in ("buyer", "company"):
+        sub = c.get(sk)
+        if isinstance(sub, dict):
+            for k in ("license", "license_number", "license_no"):
+                v = sub.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return ""
+
+
+def _city_of(c):
+    if not isinstance(c, dict):
+        return ""
+    v = c.get("city")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    for sk in ("address", "delivery_address", "corporate_address", "buyer", "company"):
+        sub = c.get(sk)
+        if isinstance(sub, dict):
+            v = sub.get("city")
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+
+def _cust_names(c):
+    """All plausible name strings for a customer, normalized for matching."""
+    names = set()
+    for nm in (_name_of(c), _name_of(c.get("buyer") if isinstance(c, dict) else None),
+               _first(c, "name", "display_name", "company_name") if isinstance(c, dict) else None):
+        if nm:
+            names.add(str(nm).strip().lower())
+    return names
+
+
+def fetch_customers():
+    """Page through the customers endpoint. Returns [] on any failure (fail-safe)."""
+    if not API_KEY:
+        return []
+    url = f"{API_BASE}{CUSTOMERS_ENDPOINT}"
+    resp = _get(url, {"page_size": PAGE_SIZE, "page": 1})
+    if resp.status_code == 403:
+        print("  NOTE: 403 on customers endpoint — the App lacks 'Customers' read "
+              "permission. Add it in LeafLink (Settings > Applications) to enable "
+              "sales-rep enrichment. Skipping for now.")
+        return []
+    if resp.status_code == 404:
+        print(f"  NOTE: 404 on {CUSTOMERS_ENDPOINT} — endpoint path may differ; "
+              "set LEAFLINK_CUSTOMERS_ENDPOINT. Skipping rep enrichment.")
+        return []
+    if resp.status_code != 200:
+        print(f"  NOTE: customers endpoint returned {resp.status_code}; "
+              "skipping rep enrichment.")
+        return []
+    out = []
+    while True:
+        data = resp.json()
+        batch = data.get("results", data if isinstance(data, list) else [])
+        out.extend(batch)
+        nxt = data.get("next") if isinstance(data, dict) else None
+        if not nxt:
+            break
+        resp = _get(nxt, None)
+        if resp.status_code != 200:
+            break
+    return out
+
+
+def build_enrichment(customers, user_map):
+    """Build id/name -> rep/state/license maps from the customer list.
+    Rep = the customer's `managers` (user IDs) resolved via user_map; falls back
+    to a 'Rep #<id>' label when a name can't be resolved."""
+    enrich = {"rep_by_id": {}, "rep_by_name": {},
+              "state_by_id": {}, "state_by_name": {},
+              "lic_by_id": {}, "lic_by_name": {},
+              "city_by_id": {}, "city_by_name": {}}
+    reps_found = 0
+    for c in customers:
+        cid = _first(c, "id", "pk", "customer_id")
+        mids = _manager_ids(c)
+        rep = ", ".join(user_map.get(i) or (i if not i.isdigit() else f"Rep #{i}")
+                        for i in mids) if mids else ""
+        state, lic, city = _state_of(c), _license_of(c), _city_of(c)
+        if rep:
+            reps_found += 1
+        if cid is not None:
+            if rep:
+                enrich["rep_by_id"].setdefault(str(cid), rep)
+            if state:
+                enrich["state_by_id"].setdefault(str(cid), state)
+            if lic:
+                enrich["lic_by_id"].setdefault(str(cid), lic)
+            if city:
+                enrich["city_by_id"].setdefault(str(cid), city)
+        for nm in _cust_names(c):
+            if rep:
+                enrich["rep_by_name"].setdefault(nm, rep)
+            if state:
+                enrich["state_by_name"].setdefault(nm, state)
+            if lic:
+                enrich["lic_by_name"].setdefault(nm, lic)
+            if city:
+                enrich["city_by_name"].setdefault(nm, city)
+    enrich["_reps_found"] = reps_found
+    return enrich
+
+
+def _order_customer_keys(o):
+    """Return (customer_id_str, normalized_name) for joining to the enrich maps."""
+    cust = o.get("customer")
+    cid = ""
+    if isinstance(cust, dict):
+        v = _first(cust, "id", "pk", "customer_id")
+        cid = str(v) if v is not None else ""
+    elif isinstance(cust, (int, str)) and str(cust).strip():
+        cid = str(cust).strip()
+    nm = (_name_of(cust) or _name_of(o.get("buyer")) or "").strip().lower()
+    return cid, nm
+
+
+def flatten(orders, brand_q, from_date="", seller_id="", enrich=None, inv=None, brand_map=None):
+    enrich = enrich or {}
+    rep_by_id = enrich.get("rep_by_id", {}); rep_by_name = enrich.get("rep_by_name", {})
+    state_by_id = enrich.get("state_by_id", {}); state_by_name = enrich.get("state_by_name", {})
+    lic_by_id = enrich.get("lic_by_id", {}); lic_by_name = enrich.get("lic_by_name", {})
+    city_by_id = enrich.get("city_by_id", {}); city_by_name = enrich.get("city_by_name", {})
+    inv = inv or {}
+    inv_by_id = inv.get("by_id", {}); inv_by_sku = inv.get("by_sku", {})
+    inv_brand_by_id = inv.get("brand_by_id", {}); inv_brand_by_sku = inv.get("brand_by_sku", {})
+    brand_map = brand_map or {}
+    rows = []
+    seller_ids, brand_ids_seen = set(), set()
+    matched = total_lines = skipped_old = skipped_company = skipped_status = 0
+    name_fallback = 0
+    rep_orders = 0
+    state_fixed, state_blank_filled = {}, 0
+    recon_order_total = recon_net_total = recon_gross_total = 0.0
+    brand_q = (brand_q or "").strip().lower()
+    from_date = (from_date or "").strip()
+    seller_id = str(seller_id or "").strip()
+
+    for o in orders:
+        s = o.get("seller")
+        sid = s if not isinstance(s, dict) else s.get("id")
+        if s is not None:
+            seller_ids.add(sid)
+        for b in (o.get("brand_ids") or []):
+            brand_ids_seen.add(b)
+        _oids = [str(b) for b in (o.get("brand_ids") or [])]
+        _onames = [brand_map.get(i) for i in _oids if brand_map.get(i)]
+        order_brand = ", ".join(_onames) if _onames else (("Brand " + _oids[0]) if _oids else "")
+
+        # Company filter: only Medfarms (seller id).
+        if seller_id and str(sid) != seller_id:
+            skipped_company += 1
+            continue
+
+        # Status filter: drop non-sold statuses (Cancelled/Rejected by default).
+        ostatus = _first(o, "status", "order_status")
+        if EXCLUDE_STATUSES and str(ostatus or "").lower() in EXCLUDE_STATUSES:
+            skipped_status += 1
+            continue
+
+        order_date = _first(o, "created_on", "created", "order_placed_date", "date")
+        if from_date:
+            dk = _date_key(order_date)
+            if dk and dk < from_date:
+                skipped_old += 1
+                continue
+
+        order_total = _amount(o.get("total"))
+        if order_total is not None:
+            recon_order_total += order_total
+
+        # Enrich: assigned sales rep / state / license from the customers endpoint,
+        # joined by customer id first, then normalized buyer name.
+        _cid, _cnm = _order_customer_keys(o)
+        _rep = (rep_by_id.get(_cid) or rep_by_name.get(_cnm)
+                or _name_of(_first(o, "sales_rep", "sales_reps")) or "")
+        _state = state_by_id.get(_cid) or state_by_name.get(_cnm) or ""
+        _lic = lic_by_id.get(_cid) or lic_by_name.get(_cnm) or ""
+        _city = city_by_id.get(_cid) or city_by_name.get(_cnm) or ""
+        if HOME_STATE:
+            _raw_state = (_state or "").strip()
+            if _raw_state.upper() != HOME_STATE.upper():
+                if _raw_state:
+                    state_fixed[_raw_state.upper()] = state_fixed.get(_raw_state.upper(), 0) + 1
+                else:
+                    state_blank_filled += 1
+                _state = HOME_STATE
+        if _rep:
+            rep_orders += 1
+
+        common = {
+            "order_number": _first(o, "short_id", "number", "id"),
+            "order_uid": _first(o, "number", "id"),
+            "order_status": _first(o, "status", "order_status"),
+            "order_date": order_date,
+            "delivery_date": _first(o, "ship_date", "delivery_date"),
+            "buyer_name": _name_of(o.get("customer")) or _name_of(o.get("buyer")),
+            "buyer_state": _state,
+            "buyer_city": _city,
+            "buyer_license": _lic,
+            "sales_rep": _rep,
+            "payment_status": _payment_status(o),
+            "paid": bool(o.get("paid")),
+            "payment_term": o.get("payment_term") or "",
+            "order_total": order_total,
         }
-      }, /*#__PURE__*/React.createElement("strong", null, fmtNum(p.available)))));
-    });
-    return out;
-  })(), oosItems.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    colSpan: "9",
-    style: {
-      textAlign: 'center',
-      padding: '28px',
-      color: 'var(--text-faint)'
+
+        # Pass 1: parse every line, compute gross, and the order's gross subtotal.
+        parsed = []
+        order_gross = 0.0
+        for li in (o.get("line_items") or o.get("lineitems") or []):
+            if not isinstance(li, dict):
+                continue
+            prod = _frozen_product(li)
+            pname = prod.get("name") or _first(li, "product_name") or ""
+            _sku = (prod.get("sku") or "").strip()
+            _lpid = li.get("product")
+            _lpid = str(_lpid) if _lpid is not None else (str(prod.get("id")) if prod.get("id") is not None else "")
+            _cat_brand = inv_brand_by_sku.get(_sku) or inv_brand_by_id.get(_lpid) or ""
+            _pbid = prod.get("brand")
+            if isinstance(_pbid, dict):
+                _pbid = _pbid.get("id")
+            _line_brand = brand_map.get(str(_pbid)) if _pbid is not None else ""
+            # Name-based fallback, MULTI-BRAND ORDERS ONLY: when a line has no precise
+            # brand (SKU not in catalog), match its product name against THIS order's
+            # own resolved brand names. Accept only when exactly one of them matches,
+            # so we never reassign to a brand the order didn't actually contain.
+            _name_brand = ""
+            if not _cat_brand and not _line_brand and len(_onames) > 1:
+                _pn = pname.lower()
+                _hits = list({nm for nm in _onames if nm and nm.lower() in _pn})
+                if len(_hits) == 1:
+                    _name_brand = _hits[0]
+                    name_fallback += 1
+            # Precise catalog/line brand wins, then the constrained name match, then
+            # the order-level brand_ids label for anything still ambiguous.
+            brand = (_cat_brand or _line_brand or _name_brand or order_brand
+                     or _name_of(prod.get("brand")) or _name_of(prod.get("brand_name")) or pname)
+            qty = _amount(li.get("quantity")) or 0.0
+            mult = _amount(li.get("unit_multiplier")) or 1.0
+            sold_units = qty / mult if mult else qty
+            unit_price = _amount(li.get("ordered_unit_price"))
+            sale_price = _amount(li.get("sale_price"))
+            on_sale = bool(li.get("on_sale")) or (sale_price or 0) > 0
+            eff = sale_price if (on_sale and (sale_price or 0) > 0) else unit_price
+            gross = (eff or 0) * sold_units
+            order_gross += gross
+            parsed.append((li, prod, pname, brand, qty, mult, sold_units,
+                           unit_price, sale_price, gross))
+
+        # Net allocation: scale each line's gross so the order's lines sum to the
+        # actual order total (distributes order-level discount/tax/shipping). This
+        # makes the dashboard's revenue tie out to LeafLink's order totals exactly.
+        scale = (order_total / order_gross) if (order_total is not None and order_gross) else 1.0
+        recon_gross_total += order_gross
+        recon_net_total += order_gross * scale
+
+        # Pass 2: emit rows for brand matches.
+        for (li, prod, pname, brand, qty, mult, sold_units,
+             unit_price, sale_price, gross) in parsed:
+            total_lines += 1
+            if brand_q and brand_q not in brand.lower():
+                continue
+            matched += 1
+            net = gross * scale
+            _pid = li.get("product")
+            _pid = str(_pid) if _pid is not None else (str(prod.get("id")) if prod.get("id") is not None else "")
+            _sku = prod.get("sku") or ""
+            _cur_inv = (inv_by_id.get(_pid) if _pid else None)
+            if _cur_inv is None and _sku:
+                _cur_inv = inv_by_sku.get(_sku)
+            rows.append({
+                **common,
+                "brand": brand,
+                "product_name": pname,
+                "product_sku": prod.get("sku") or "",
+                "current_inventory": _cur_inv,
+                "product_line": prod.get("product_line_name") or "",
+                "product_category": _name_of(prod.get("category")) or prod.get("product_line_name") or "",
+                "product_type": prod.get("product_line_name") or "",
+                "quantity": qty,
+                "unit_multiplier": mult,
+                "units_sold": sold_units,
+                "unit_price": unit_price,
+                "sale_price": sale_price,
+                "is_sample": bool(li.get("is_sample")),
+                "gross": round(gross, 2),
+                "discount": round(gross - net, 2),
+                "revenue": round(net, 2),
+            })
+
+    stats = {
+        "seller_ids": sorted(x for x in seller_ids if x is not None),
+        "brand_ids": sorted(brand_ids_seen),
+        "matched": matched, "total_lines": total_lines, "skipped_old": skipped_old,
+        "skipped_company": skipped_company, "skipped_status": skipped_status,
+        "name_fallback": name_fallback,
+        "rep_orders": rep_orders,
+        "state_fixed": state_fixed, "state_blank_filled": state_blank_filled,
+        "recon_order_total": round(recon_order_total, 2),
+        "recon_net_total": round(recon_net_total, 2),
+        "recon_gross_total": round(recon_gross_total, 2),
     }
-  }, "Nothing out of stock — every SKU has units available to order"))))))), /*#__PURE__*/React.createElement(StickyFooter, {
-    nav: NAV,
-    active: ACTIVE,
-    brands: distinct.brands,
-    brand: filters.brand,
-    onBrand: b => upd('brand', b)
-  }));
-}
-ReactDOM.createRoot(document.getElementById('root')).render(/*#__PURE__*/React.createElement(App, null));
-</script>
-</body>
-</html>
+    return rows, stats
+
+
+# ----------------------------------------------------------------------------
+def _inv_value(p):
+    """First recognizable inventory field on a product row -> (value, field)."""
+    for f in INV_FIELDS:
+        if f in p and p[f] is not None:
+            v = _amount(p[f])
+            if v is not None:
+                return v, f
+    return None, None
+
+
+def _product_status(p):
+    """Lowercased listing status of a product, trying candidate field names.
+    Returns ("", None) if no recognizable status field is present."""
+    for f in STATUS_FIELDS:
+        if f in p and p[f] is not None:
+            return str(_name_of(p[f]) or p[f]).strip().lower(), f
+    return "", None
+
+
+def fetch_inventory(brand_map=None):
+    """Current-inventory pull from the seller catalog, in two phases.
+
+      Phase 1 — the company-scoped product list. Fast, but LeafLink sometimes
+                truncates it (here it omitted Homiez and Hyman entirely).
+      Phase 2 — a per-brand sweep: for every brand id auto-discovered from the
+                brands endpoint, query products filtered to that brand, so brands
+                missing from phase 1 still load. Results from both phases are
+                merged and deduped by product id/sku.
+
+    Returns {"by_id","by_sku","catalog","brand_by_id","brand_by_sku"}. Any
+    failure leaves the maps empty and the dashboard simply shows '—'. The pull
+    prints a per-endpoint / per-brand diagnostic so a real run reveals exactly
+    which path surfaces each brand.
+    """
+    inv_by_id, inv_by_sku = {}, {}
+    brand_by_id, brand_by_sku = {}, {}
+    brand_map = brand_map or {}
+    catalog, catalog_seen = [], set()
+    field_hits = {}
+    _sample = {"keys": None}
+
+    def ingest(p):
+        """Fold one product dict into the shared accumulators.
+        Returns (counted, kept_in_catalog, status_string)."""
+        if not isinstance(p, dict):
+            return (False, False, "")
+        if _sample["keys"] is None:
+            _sample["keys"] = sorted(p.keys())
+        val, f = _inv_value(p)
+        pid = p.get("id")
+        sku = str(p.get("sku") or "").strip()
+        name = p.get("name") or ""
+        line = (p.get("product_line_name") or _name_of(p.get("product_line"))
+                or _name_of(p.get("category")) or "")
+        _pb = p.get("brand")
+        _pbid = _pb.get("id") if isinstance(_pb, dict) else _pb
+        _pbname = _name_of(p.get("brand")) or _name_of(p.get("brand_name")) or ""
+        if not _pbname and _pbid is not None:
+            _pbname = brand_map.get(str(_pbid), "")
+        if _pbname:
+            if pid is not None:
+                brand_by_id[str(pid)] = _pbname
+            if sku:
+                brand_by_sku[sku] = _pbname
+        if val is not None:
+            field_hits[f] = field_hits.get(f, 0) + 1
+            if pid is not None:
+                inv_by_id[str(pid)] = val
+            if sku:
+                inv_by_sku[sku] = val
+        # Brand filter (BRAND_FILTER is "" on the multi-brand board, so kept).
+        brand_str = (_name_of(p.get("brand")) or _name_of(p.get("brand_name")) or name).lower()
+        if BRAND_FILTER.strip() and BRAND_FILTER.lower() not in brand_str:
+            return (True, False, "")
+        # Listing-state filter: keep only Available-type products. If no status
+        # field is present, keep it rather than risk dropping the whole catalog.
+        status, sf = _product_status(p)
+        # Archived records are dropped whatever else is true. Beyond that, if the
+        # API exposes no status field at all we keep the product rather than risk
+        # silently dropping the whole catalog.
+        if _is_archived(status, p):
+            return (True, False, status or "archived")
+        if sf is not None and not _keep_listing(status, _pbname or _name_of(p.get("brand")), p):
+            return (True, False, status)
+        ckey = str(pid) if pid is not None else sku
+        if ckey and ckey not in catalog_seen:
+            catalog_seen.add(ckey)
+            catalog.append({"id": str(pid) if pid is not None else "",
+                            "sku": sku, "name": name, "line": line,
+                            "status": status,
+                            "brand": _pbname or _name_of(p.get("brand")) or "",
+                            "inventory": _amount(p.get("quantity")),
+                            "reserved": _amount(p.get("reserved_qty")),
+                            "available": val})
+        return (True, True, status)
+
+    def scan(url, params, label):
+        """Page through one endpoint, ingesting every product. Returns stats
+        ({seen,kept,added,pages}) or None if the endpoint isn't usable."""
+        before = len(catalog)
+        seen = kept = pages = 0
+        status_counts = {}
+        resp = _get(url, params)
+        if resp.status_code == 404:
+            print(f"  inv[{label}]: 404 — skipped")
+            return None
+        if resp.status_code != 200:
+            print(f"  inv[{label}]: HTTP {resp.status_code} — skipped")
+            return None
+        while resp is not None and pages < INV_MAX_PAGES:
+            if resp.status_code != 200:
+                break
+            try:
+                data = resp.json()
+            except Exception:
+                break
+            items = data.get("results") if isinstance(data, dict) else data
+            if not items:
+                break
+            for p in items:
+                counted, keptone, status = ingest(p)
+                if counted:
+                    seen += 1
+                    k = status or "(none)"
+                    status_counts[k] = status_counts.get(k, 0) + 1
+                    if keptone:
+                        kept += 1
+            pages += 1
+            nxt = data.get("next") if isinstance(data, dict) else None
+            if not nxt:
+                break
+            resp = _get(nxt, None)
+        if pages >= INV_MAX_PAGES:
+            print(f"  inv[{label}]: hit INV_MAX_PAGES={INV_MAX_PAGES} — raise LEAFLINK_INV_MAX_PAGES if more remain")
+        added = len(catalog) - before
+        print(f"  inv[{label}]: {seen} products, {kept} available, +{added} new "
+              f"({pages}p) status={status_counts}")
+        return {"seen": seen, "kept": kept, "added": added, "pages": pages}
+
+    # ---- Phase 1: company-scoped product list ----
+    if SELLER_ID:
+        scan(f"{API_BASE}/api/v2/companies/{SELLER_ID}/products/",
+             {"page_size": PAGE_SIZE, "page": 1}, f"company/{SELLER_ID}")
+    for ep in PRODUCTS_ENDPOINTS:
+        if "/companies/" in ep:
+            continue  # already covered above
+        # An unscoped /products/ would return the whole marketplace; only sweep
+        # it if the user explicitly points PRODUCTS_ENDPOINTS at a scoped path.
+
+    # ---- Phase 2: per-brand sweep over auto-discovered brand ids ----
+    if INV_PER_BRAND and brand_map:
+        print(f"  inv: per-brand sweep over {len(brand_map)} discovered brand(s) "
+              f"via {INV_BRAND_ENDPOINTS} params={INV_BRAND_PARAMS}…")
+        for bid, bname in sorted(brand_map.items(), key=lambda kv: (kv[1] or "").lower()):
+            got = False
+            for ep in INV_BRAND_ENDPOINTS:
+                url = f"{API_BASE}{ep}"
+                scoped = "/companies/" not in ep  # add company scope on global /products/
+                for param in INV_BRAND_PARAMS:
+                    params = {param: bid, "page_size": PAGE_SIZE, "page": 1}
+                    if scoped and SELLER_ID:
+                        params["company"] = SELLER_ID
+                        params["seller"] = SELLER_ID
+                    st = scan(url, params, f"{bname}#{bid}:{ep.split('/api/v2/')[-1]}?{param}")
+                    if st and st["seen"] > 0:
+                        got = True
+                        break
+                if got:
+                    break
+            if not got:
+                print(f"  inv[{bname}#{bid}]: no products returned by any endpoint/param")
+
+    # ---- Summary ----
+    cat_by_brand = {}
+    for c in catalog:
+        b = c.get("brand") or "(unbranded)"
+        cat_by_brand[b] = cat_by_brand.get(b, 0) + 1
+    cat_by_brand = dict(sorted(cat_by_brand.items(), key=lambda kv: -kv[1]))
+    print(f"Inventory: {len(catalog)} available SKUs across {len(cat_by_brand)} "
+          f"brand(s): {cat_by_brand}")
+    print(f"  inv maps: {len(inv_by_id)} by id / {len(inv_by_sku)} by sku; "
+          f"inv fields hit={field_hits}; listed filter={sorted(LISTED_STATES)}")
+    if _sample["keys"]:
+        print(f"  first product keys: {_sample['keys']}")
+    if not catalog:
+        print("  Inventory pull found nothing — column will show '—'. Check the "
+              "diagnostics above for which endpoint/param returns products.")
+    return {"by_id": inv_by_id, "by_sku": inv_by_sku, "catalog": catalog,
+            "brand_by_id": brand_by_id, "brand_by_sku": brand_by_sku}
+
+
+def _csv_num(s):
+    """Parse a CSV numeric cell like '12,100' or '10.0' -> float (None if blank)."""
+    s = (s or "").replace(",", "").replace("$", "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _find_inventory_csv():
+    """Locate a committed inventory CSV in the repo. Returns a Path or None."""
+    flag = INVENTORY_CSV.strip()
+    if flag.lower() in ("off", "none", "0", "false"):
+        return None
+    if flag:
+        p = Path(flag)
+        return p if p.is_file() else None
+    here = OUTPUT_FILE.parent
+    exact = here / "inventory.csv"
+    if exact.is_file():
+        return exact
+    # LeafLink's dated export names (inventory-overview_YYYY-MM-DD_...) sort by
+    # date, so the lexicographically-last match is the newest export.
+    cands = sorted(here.glob("inventory*.csv"))
+    return cands[-1] if cands else None
+
+
+def _csv_col(row, *names):
+    """Tolerant column lookup: exact header first, then case-insensitive match."""
+    for n in names:
+        if n in row and row[n] not in (None, ""):
+            return row[n]
+    low = {k.lower(): k for k in row}
+    for n in names:
+        if n.lower() in low:
+            return row[low[n.lower()]]
+    return ""
+
+
+def inventory_catalog_from_csv():
+    """Build the dashboard inventory list from a committed LeafLink CSV export.
+
+    Returns a list of catalog dicts (same shape fetch_inventory produces) or
+    None when no CSV is present (so the API catalog is used as fallback).
+    Filtered to LISTED_STATES (default 'available'), exactly like the API path.
+    Touches only the displayed inventory — order/brand resolution is unaffected.
+    """
+    path = _find_inventory_csv()
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as fh:
+            reader = csv.DictReader(fh)
+            out, seen, states = [], set(), {}
+            for r in reader:
+                status = str(_csv_col(r, "Listing State") or "").strip()
+                states[status or "(blank)"] = states.get(status or "(blank)", 0) + 1
+                if not _keep_listing(status, str(_csv_col(r, "Brand") or ""), r):
+                    continue
+                pid = str(_csv_col(r, "Product ID") or "").strip()
+                sku = str(_csv_col(r, "SKU") or "").strip()
+                key = pid or sku
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                # Units per case is only expressed in the export as the ratio
+                # of the unit and case columns, so derive it here rather than
+                # making the dashboard reverse it out of order history.
+                _u = _csv_num(_csv_col(r, "Inventory (Units)"))
+                _c = _csv_num(_csv_col(r, "Inventory (Cases)"))
+                _per = round(_u / _c, 4) if _u and _c else 0
+                out.append({
+                    "id": pid,
+                    "sku": sku,
+                    "name": str(_csv_col(r, "Name") or "").strip(),
+                    "line": str(_csv_col(r, "Product Line") or "").strip(),
+                    "status": status,
+                    "brand": str(_csv_col(r, "Brand") or "").strip(),
+                    "inventory": _u,
+                    "reserved": _csv_num(_csv_col(r, "Reserved Inventory (Units)")),
+                    "available": _csv_num(_csv_col(r, "Available Inventory (Units)")),
+                    "units_per_case": _per,
+                    "case_price": _csv_num(_csv_col(r, "Wholesale Price")),
+                })
+    except Exception as e:
+        print(f"  NOTE: could not read inventory CSV {path} ({e}); using API catalog.")
+        return None
+    by_brand = {}
+    for e in out:
+        b = e["brand"] or "(blank)"
+        by_brand[b] = by_brand.get(b, 0) + 1
+    print(f"Inventory: built from {path.name} -> {len(out)} listed products "
+          f"(filter={sorted(LISTED_STATES) or 'all states'}; "
+          f"file states={states}; by brand={by_brand})")
+    return out
+
+
+def load_existing():
+    """Return (rows, from_date) from the committed sales_data.json, or ([], "")."""
+    if OUTPUT_FILE.exists():
+        try:
+            with gzip.open(OUTPUT_FILE, "rt", encoding="utf-8") as f:
+                d = json.load(f)
+            return d.get("rows", []) or [], d.get("from_date", "") or ""
+        except Exception as e:
+            print(f"  NOTE: could not read existing {OUTPUT_FILE.name} ({e}); full pull.")
+    return [], ""
+
+
+def main():
+    # Full vs incremental. Incremental only when enabled AND the committed data was
+    # already backfilled at this FROM_DATE, so we never silently skip history.
+    existing_rows, existing_from = load_existing()
+    incremental = (INCREMENTAL_DAYS > 0 and bool(existing_rows) and existing_from == FROM_DATE)
+    if incremental:
+        inc_start = (datetime.now() - timedelta(days=INCREMENTAL_DAYS)).strftime("%Y-%m-%d")
+        pull_start = max(inc_start, FROM_DATE)
+        print(f"INCREMENTAL run: pulling {pull_start} .. today, "
+              f"merging into {len(existing_rows)} existing rows (last {INCREMENTAL_DAYS} days).")
+        orders = fetch_all(start_override=pull_start)
+    else:
+        why = ("incremental disabled (LEAFLINK_INCREMENTAL_DAYS=0)" if INCREMENTAL_DAYS <= 0
+               else "no existing data yet" if not existing_rows
+               else f"existing data backfilled at '{existing_from}', need '{FROM_DATE}' — backfilling")
+        print(f"FULL pull ({why}).")
+        orders = fetch_all()
+    print(f"Fetched {len(orders)} orders.")
+
+    # Enrich with sales rep (and state/license when available) from customers.
+    print(f"Fetching customers from {CUSTOMERS_ENDPOINT} for sales-rep enrichment...")
+    customers = fetch_customers()
+    print("Resolving rep names from users endpoint(s)...")
+    user_map = fetch_users() if customers else {}
+    enrich = build_enrichment(customers, user_map)
+    print(f"Users resolved to names: {len(user_map)} | Customers fetched: {len(customers)} "
+          f"| customers with a rep: {enrich.get('_reps_found', 0)}")
+    if customers and enrich.get("_reps_found", 0) == 0:
+        print("  No 'managers' on customers. First customer keys: "
+              f"{sorted((customers[0] or {}).keys())}")
+
+    # Current inventory from the seller product catalog (best-effort, bounded).
+    # OFF by default so it can never stall the orders backfill.
+    print("Fetching brands for brand-name resolution...")
+    brand_map = fetch_brands()
+    for _kv in [x for x in os.getenv("LEAFLINK_BRAND_OVERRIDES", "").split(",") if ":" in x]:
+        _k, _v = _kv.split(":", 1); brand_map[_k.strip()] = _v.strip()
+    if brand_map:
+        print(f"Brands resolved: {len(brand_map)} | e.g. {list(brand_map.items())[:6]}")
+    else:
+        print("Brands resolved: 0 (set LEAFLINK_BRANDS_ENDPOINTS / LEAFLINK_BRAND_OVERRIDES)")
+
+    # Product catalog: needed for the SKU->brand map (splits multi-brand orders to
+    # the correct brand per line) and, when enabled, current inventory quantities.
+    if PULL_INVENTORY or RESOLVE_BRANDS_FROM_CATALOG:
+        print("Fetching product catalog (SKU->brand map"
+              + (" + current inventory" if PULL_INVENTORY else "") + ")...")
+        inv = fetch_inventory(brand_map)
+        print(f"Catalog brand map: {len(inv.get('brand_by_sku', {}))} sku / "
+              f"{len(inv.get('brand_by_id', {}))} id entries")
+    else:
+        inv = {"by_id": {}, "by_sku": {}, "brand_by_id": {}, "brand_by_sku": {}}
+
+    # If a LeafLink inventory CSV is committed to the repo, it is the source of
+    # truth for the dashboard's Current Inventory section (the products API can
+    # under-return the catalog). This replaces ONLY the displayed catalog; the
+    # SKU->brand map and order resolution above are left exactly as they were.
+    _csv_catalog = inventory_catalog_from_csv()
+    if _csv_catalog is not None:
+        inv["catalog"] = _csv_catalog
+
+    if orders:
+        first = orders[0]
+        order_lite = {k: v for k, v in first.items() if k not in ("line_items", "lineitems")}
+        print("\n--- FIRST ORDER (line_items removed) ---")
+        print(json.dumps(order_lite, default=str)[:2500])
+        lis = first.get("line_items") or first.get("lineitems") or []
+        if lis and isinstance(lis[0], dict):
+            print("\n--- FIRST LINE ITEM ---")
+            print(json.dumps(lis[0], default=str)[:2500])
+        print("--- end sample ---\n")
+
+    rows, st = flatten(orders, BRAND_FILTER, FROM_DATE, SELLER_ID, enrich, inv, brand_map)
+
+    if BRAND_FILTER.strip() and st["matched"] == 0 and st["total_lines"] > 0:
+        print(f"WARNING: brand '{BRAND_FILTER}' matched 0 of {st['total_lines']} lines.")
+        print("Keeping ALL rows so you still get data — check the product-name field.")
+        rows, st = flatten(orders, "", FROM_DATE, SELLER_ID, enrich, inv, brand_map)
+
+    if incremental:
+        fresh_uids = {str(o.get("number") or o.get("id")) for o in orders}
+        kept = [r for r in existing_rows if str(r.get("order_uid")) not in fresh_uids]
+        # Refresh current inventory on the kept (older) rows too, joined by sku,
+        # so the Current Inv. column stays current for products not sold recently.
+        by_sku = (inv or {}).get("by_sku", {})
+        if by_sku:
+            for r in kept:
+                s = r.get("product_sku")
+                if s and s in by_sku:
+                    r["current_inventory"] = by_sku[s]
+        fresh_n = len(rows)
+        rows = kept + rows
+        print(f"MERGED: {len(kept)} older rows kept + {fresh_n} fresh = {len(rows)} total "
+              f"(replaced {len(existing_rows) - len(kept)} rows for {len(fresh_uids)} window orders).")
+
+    print(f"\nSeller id(s) seen: {st['seller_ids']}  (Medfarms = 9105)")
+    print(f"Company filter: seller {SELLER_ID or '(none)'}  ->  skipped {st['skipped_company']} other-company orders")
+    print(f"Status filter: excluded {EXCLUDE_STATUSES or '(none)'}  ->  skipped {st['skipped_status']} orders")
+    print(f"Brand id(s) in data:  {st['brand_ids']}   (Chill Medicated = 2425)")
+    print(f"Date floor: {FROM_DATE or '(none)'}  ->  skipped {st['skipped_old']} older orders")
+    if HOME_STATE:
+        print(f"State normalize -> {HOME_STATE}: fixed non-{HOME_STATE} states {st.get('state_fixed') or '{}'}, "
+              f"filled {st.get('state_blank_filled', 0)} blank line(s)")
+    print(f"Line items: {st['total_lines']} in range -> {st['matched']} kept (brand '{BRAND_FILTER}')")
+    print(f"Name-based fallback reassigned {st['name_fallback']} line(s) in multi-brand orders.")
+    print(f"Sales-rep enrichment: {st['rep_orders']} orders matched a rep "
+          f"(0 = customers endpoint had no rep data / not permitted)")
+    # After net allocation, sum of net should equal sum of order totals (ratio ~1.000).
+    ot, nt, gt = st["recon_order_total"], st["recon_net_total"], st["recon_gross_total"]
+    ratio = (nt / ot) if ot else 0
+    print(f"RECONCILE (all brands): net ${nt:,.2f} vs order totals ${ot:,.2f} "
+          f"(ratio {ratio:.4f}; should be ~1.0000)")
+    print(f"  gross (list price) was ${gt:,.2f} -> order-level discounts/adj ${gt-nt:,.2f}")
+
+    payload = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "source": "leaflink",
+        "seller_ids": st["seller_ids"],
+        "company_filter": SELLER_ID,
+        "brand_filter": BRAND_FILTER,
+        "from_date": FROM_DATE,
+        "order_count": len({str(r.get("order_uid")) for r in rows if r.get("order_uid")}),
+        "row_count": len(rows),
+        "inventory": (inv or {}).get("catalog", []),
+        "rows": rows,
+    }
+    with gzip.open(OUTPUT_FILE, "wt", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"), default=str)
+    size_mb = OUTPUT_FILE.stat().st_size / 1e6
+    print(f"\nSaved -> {OUTPUT_FILE} ({size_mb:.2f} MB, {len(rows)} rows)")
+    pace_report()
+
+
+if __name__ == "__main__":
+    main()
