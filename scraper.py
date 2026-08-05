@@ -176,8 +176,31 @@ CATALOG_BRANDS = [b.strip() for b in os.getenv(
 _CATALOG_BRANDS_LC = {b.lower() for b in CATALOG_BRANDS}
 
 
-def _keep_listing(status, brand):
+# Archived / discontinued / deleted products are dead records, not stock. They
+# must never reach the board, not even for our own brands.
+ARCHIVED_STATES = {s.strip().lower() for s in os.getenv(
+    "LEAFLINK_ARCHIVED_STATES", "archived,discontinued,deleted,inactive").split(",") if s.strip()}
+ARCHIVED_FLAGS = ("is_archived", "archived", "is_deleted", "deleted", "is_discontinued")
+
+
+def _is_archived(status, product=None):
+    """True for records LeafLink has retired, by state name or boolean flag."""
+    if (status or "").strip().lower() in ARCHIVED_STATES:
+        return True
+    if isinstance(product, dict):
+        for f in ARCHIVED_FLAGS:
+            if product.get(f) is True:
+                return True
+        for f in ("archived_on", "deleted_on"):
+            if product.get(f):
+                return True
+    return False
+
+
+def _keep_listing(status, brand, product=None):
     """True when a product belongs in the dashboard catalog."""
+    if _is_archived(status, product):
+        return False
     st = (status or "").strip().lower()
     if not LISTED_STATES or st in LISTED_STATES:
         return True
@@ -944,7 +967,12 @@ def fetch_inventory(brand_map=None):
         # Listing-state filter: keep only Available-type products. If no status
         # field is present, keep it rather than risk dropping the whole catalog.
         status, sf = _product_status(p)
-        if sf is not None and not _keep_listing(status, _pbname or _name_of(p.get("brand"))):
+        # Archived records are dropped whatever else is true. Beyond that, if the
+        # API exposes no status field at all we keep the product rather than risk
+        # silently dropping the whole catalog.
+        if _is_archived(status, p):
+            return (True, False, status or "archived")
+        if sf is not None and not _keep_listing(status, _pbname or _name_of(p.get("brand")), p):
             return (True, False, status)
         ckey = str(pid) if pid is not None else sku
         if ckey and ckey not in catalog_seen:
@@ -1112,7 +1140,7 @@ def inventory_catalog_from_csv():
             for r in reader:
                 status = str(_csv_col(r, "Listing State") or "").strip()
                 states[status or "(blank)"] = states.get(status or "(blank)", 0) + 1
-                if not _keep_listing(status, str(_csv_col(r, "Brand") or "")):
+                if not _keep_listing(status, str(_csv_col(r, "Brand") or ""), r):
                     continue
                 pid = str(_csv_col(r, "Product ID") or "").strip()
                 sku = str(_csv_col(r, "SKU") or "").strip()
