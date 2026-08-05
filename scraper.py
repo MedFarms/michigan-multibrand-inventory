@@ -163,6 +163,27 @@ INVENTORY_CSV = os.getenv("LEAFLINK_INVENTORY_CSV", "")
 # Override with LEAFLINK_LISTED_STATES (comma separated) to widen or narrow.
 LISTED_STATES = {s.strip().lower() for s in
                  os.getenv("LEAFLINK_LISTED_STATES", "available,backorder").split(",") if s.strip()}
+
+# Sold-out products don't stay in an Available/Backorder state: LeafLink flips
+# them to Internal (unlisted), which is also where the whole third-party 100
+# Shafer catalog lives. Filtering on listing state alone therefore hides almost
+# every out-of-stock SKU. So for OUR brands we keep every listing state, and for
+# everyone else we keep only the sellable ones. Set LEAFLINK_CATALOG_BRANDS to
+# "" to switch this off, or "*" to keep every state for every brand.
+CATALOG_BRANDS = [b.strip() for b in os.getenv(
+    "LEAFLINK_CATALOG_BRANDS",
+    "Hyman,Chill Medicated,Covert Cups,Homiez,Value Pak Distro").split(",") if b.strip()]
+_CATALOG_BRANDS_LC = {b.lower() for b in CATALOG_BRANDS}
+
+
+def _keep_listing(status, brand):
+    """True when a product belongs in the dashboard catalog."""
+    st = (status or "").strip().lower()
+    if not LISTED_STATES or st in LISTED_STATES:
+        return True
+    if "*" in _CATALOG_BRANDS_LC:
+        return True
+    return (brand or "").strip().lower() in _CATALOG_BRANDS_LC
 STATUS_FIELDS = [f.strip() for f in os.getenv(
     "LEAFLINK_STATUS_FIELDS",
     "listing_state,status,product_status,state,listing_status,product_state"
@@ -923,7 +944,7 @@ def fetch_inventory(brand_map=None):
         # Listing-state filter: keep only Available-type products. If no status
         # field is present, keep it rather than risk dropping the whole catalog.
         status, sf = _product_status(p)
-        if sf is not None and LISTED_STATES and status not in LISTED_STATES:
+        if sf is not None and not _keep_listing(status, _pbname or _name_of(p.get("brand"))):
             return (True, False, status)
         ckey = str(pid) if pid is not None else sku
         if ckey and ckey not in catalog_seen:
@@ -1091,7 +1112,7 @@ def inventory_catalog_from_csv():
             for r in reader:
                 status = str(_csv_col(r, "Listing State") or "").strip()
                 states[status or "(blank)"] = states.get(status or "(blank)", 0) + 1
-                if LISTED_STATES and status.lower() not in LISTED_STATES:
+                if not _keep_listing(status, str(_csv_col(r, "Brand") or "")):
                     continue
                 pid = str(_csv_col(r, "Product ID") or "").strip()
                 sku = str(_csv_col(r, "SKU") or "").strip()
