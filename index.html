@@ -961,14 +961,31 @@ const normalizeRows = rows => {
 };
 
 /* ---- Data loader (gz via pako, plain-json fallback) ----------------- */
+// Read the data straight from the repo rather than from whatever copy the host
+// is serving. A Cloudflare Worker bundles its static assets at deploy time, so a
+// relative 'sales_data.json.gz' resolves to the snapshot taken when the Worker
+// was last deployed - the scraper's commits never reach the page and the board
+// looks frozen until someone redeploys. The raw URL always reflects main.
+// Falls back to the local file if the raw host can't be reached.
+const DATA_URL = 'https://raw.githubusercontent.com/MedFarms/michigan-multibrand-inventory/main/sales_data.json.gz';
+const DATA_FALLBACK = 'sales_data.json.gz';
+
 function useData(file) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   useEffect(() => {
     const load = () => {
-      fetch((file || 'sales_data.json.gz') + '?t=' + Date.now()).then(r => {
-        if (!r.ok) throw new Error('Could not load ' + (file || 'sales_data.json.gz') + ' (HTTP ' + r.status + ')');
+      const primary = file || DATA_URL;
+      // raw.githubusercontent caches for 5 minutes; the timestamp busts it so a
+      // fresh scrape shows up on the next poll instead of up to 5 min later.
+      const grab = u => fetch(u + '?t=' + Date.now()).then(r => {
+        if (!r.ok) throw new Error('Could not load ' + u + ' (HTTP ' + r.status + ')');
         return r.arrayBuffer();
+      });
+      grab(primary).catch(e => {
+        if (primary === DATA_FALLBACK) throw e;
+        console.warn('Falling back to the bundled data file:', e.message);
+        return grab(DATA_FALLBACK);
       }).then(buf => {
         const bytes = new Uint8Array(buf);
         let text;
@@ -1555,7 +1572,7 @@ function App() {
   const {
     data,
     error
-  } = useData('sales_data.json.gz');
+  } = useData(DATA_URL);
   const [filters, setFilters] = useState({
     brand: '',
     status: '',
