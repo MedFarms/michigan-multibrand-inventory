@@ -19,10 +19,12 @@ permissions:
 
 concurrency:
   group: scrape-leaflink-mi
-  # A newer run supersedes an older one. Each run rewrites the whole data file,
-  # so a superseded run has nothing worth finishing - and without this, runs
-  # triggered every 10 minutes stack up behind each other when one runs long.
-  cancel-in-progress: true
+  # MUST stay false. With cancel-in-progress: true, any run lasting longer than
+  # the 10-minute trigger interval is killed by the next trigger before it can
+  # commit - so a slow repo never finishes a run at all, and a push of new code
+  # gets cancelled out from under you. Queueing is safe here: GitHub holds at
+  # most ONE pending run per group and replaces it, so there is no backlog.
+  cancel-in-progress: false
 
 jobs:
   scrape:
