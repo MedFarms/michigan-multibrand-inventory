@@ -484,6 +484,14 @@
 .focus-clear { font-family:'JetBrains Mono',monospace; font-size:11px; padding:5px 12px; background:var(--accent);
   color:#fff; border:none; border-radius:999px; cursor:pointer; letter-spacing:.06em; }
 
+/* Header back-to-hub link — same destination as the sticky footer, so the
+   page can be left from the top without scrolling to the bottom first. */
+.tb-back { display:inline-flex; align-items:center; padding:6px 13px; border-radius:999px;
+  border:1px solid var(--accent); color:var(--text-on-bg); text-decoration:none; font-weight:600;
+  font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:.06em; white-space:nowrap;
+  transition:background .18s var(--ease), color .18s var(--ease), border-color .18s var(--ease); }
+.tb-back:hover { background:var(--accent-deep); color:#fff; border-color:var(--accent); }
+
 /* Sticky-footer back-to-hub link */
 .bn-back { color: var(--text); border-color: var(--accent); font-weight: 600; }
 .bn-back:hover { background: var(--accent-deep); color: #fff !important; border-color: var(--accent); }
@@ -562,9 +570,37 @@ const fmtMoneyFull = n => '$' + (n || 0).toLocaleString(undefined, {
 });
 const fmtNum = n => (Math.round(n) || 0).toLocaleString();
 const fmtPct = n => n == null || isNaN(n) ? '—' : (n >= 0 ? '' : '') + n.toFixed(1) + '%';
+// LeafLink stamps created_on in ITS OWN UTC-6/-7 offset, not Michigan time, so
+// the leading YYYY-MM-DD of the raw string is not the calendar date the order
+// shows against in LeafLink's own reports. An order placed at 00:30 in Michigan
+// arrives as the previous day at 21:30 in the feed, which silently pushes it
+// into the wrong day/week/month bucket. Convert the instant to the business
+// timezone first, then take the date.
+const BUSINESS_TZ = 'America/Detroit';
+const _tzDate = (() => {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: BUSINESS_TZ,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    });
+  } catch (e) {
+    return null;
+  }
+})();
+
 const parseDate = str => {
   if (!str) return null;
   const s = String(str).trim();
+  // Timestamp carrying an explicit offset or Z -> re-express in Michigan time.
+  if (_tzDate && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(s) && /(Z|[+-]\d{2}:?\d{2})$/.test(s)) {
+    const inst = new Date(s);
+    if (!isNaN(inst)) {
+      const p = _tzDate.format(inst).split('-');
+      if (p.length === 3) return new Date(+p[0], +p[1] - 1, +p[2]);
+    }
+  }
   const ymdM = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (ymdM) return new Date(+ymdM[1], +ymdM[2] - 1, +ymdM[3]);
   const mdyM = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
@@ -1045,7 +1081,10 @@ function Topbar({
     }
   }, section))), /*#__PURE__*/React.createElement("div", {
     className: "topbar-meta"
-  }, right, ago != null && /*#__PURE__*/React.createElement("span", null, "Updated ", ago < 1 ? 'just now' : ago + 'm ago'), /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("a", {
+    href: "https://medfarms.analyticshub.workers.dev/",
+    className: "tb-back"
+  }, "\u2190 Back to main page"), right, ago != null && /*#__PURE__*/React.createElement("span", null, "Updated ", ago < 1 ? 'just now' : ago + 'm ago'), /*#__PURE__*/React.createElement("span", {
     className: "pulse"
   })));
 }
