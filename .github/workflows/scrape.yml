@@ -44,7 +44,14 @@ jobs:
           LEAFLINK_API_KEY: ${{ secrets.LEAFLINK_API_KEY }}
           LEAFLINK_SELLER_ID: '9105'
           LEAFLINK_BRAND: ''
-          LEAFLINK_FROM_DATE: '2020-01-01'
+          # The inventory dashboard only reads order history to derive a SKU's
+          # average unit price, units per case and product line - it never charts
+          # historical sales. Every one of the 152 catalogue SKUs has sold within
+          # the last 6 months, so a 12-month window supplies all of it while
+          # cutting the payload from ~153,000 line items to roughly 45,000.
+          # Changing this value forces ONE full backfill (small, over the shorter
+          # window), then incremental runs resume.
+          LEAFLINK_FROM_DATE: '2025-08-01'
           # 'Combined' orders are the originals that LeafLink merged into a
           # replacement order. They still carry their full total, so counting
           # them double-counts that revenue - LeafLink's own order report
