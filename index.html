@@ -383,6 +383,10 @@
 
 /* --- order-form grouping rows in the inventory table --- */
 .chip { white-space: nowrap; }
+/* Shown when a refresh fails but we still have data on screen. */
+.stale-note { margin: 0 0 16px; padding: 9px 14px; border-radius: var(--radius-sm);
+  background: rgba(214,67,63,.10); border: 1px solid rgba(214,67,63,.45); color: var(--text);
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: .02em; }
 /* Non-"Available" listing states (e.g. Backorder) still carry stock, so they sit
    in the same table - this tag is what tells them apart. */
 .state-tag { display:inline-block; margin-left:8px; padding:1px 6px; border-radius:4px; vertical-align:middle;
@@ -1006,38 +1010,88 @@ const normalizeRows = rows => {
 const DATA_URL = 'https://raw.githubusercontent.com/MedFarms/michigan-multibrand-inventory/main/sales_data.json.gz';
 const DATA_FALLBACK = 'sales_data.json.gz';
 
+// Data loader.
+//
+// GitHub rate-limits raw.githubusercontent.com and answers 429 if a page
+// hammers it. Three things here keep us under that ceiling:
+//
+//   1. POLL EVERY 10 MINUTES, not every 60s. The scraper only commits about
+//      every 10 minutes, so a 60-second poll re-downloaded several MB to find
+//      the same bytes nine times out of ten.
+//   2. NO CACHE-BUSTING QUERY STRING. `?t=` + Date.now() made every request a
+//      guaranteed cache miss. raw.githubusercontent sends max-age=300, so
+//      normal caching removes most requests outright and a revalidate returns
+//      304 with no body.
+//   3. BACK OFF ON 429. Retrying a rate-limited host on the same schedule only
+//      deepens the block. Each 429 doubles the wait, up to an hour.
+//
+// A failed refresh no longer wipes the screen either: once data has loaded, a
+// later error shows as a stale-data note rather than the "No data yet" card.
+const POLL_MS = 10 * 60 * 1000;
+const MAX_BACKOFF_MS = 60 * 60 * 1000;
+
 function useData(file) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
+  const [stale, setStale] = useState(null);
   useEffect(() => {
+    let cancelled = false;
+    let timer = null;
+    let backoff = 0;
+    const schedule = ms => {
+      if (cancelled) return;
+      clearTimeout(timer);
+      timer = setTimeout(load, ms);
+    };
     const load = () => {
       const primary = file || DATA_URL;
-      // raw.githubusercontent caches for 5 minutes; the timestamp busts it so a
-      // fresh scrape shows up on the next poll instead of up to 5 min later.
-      const grab = u => fetch(u + '?t=' + Date.now()).then(r => {
+      const grab = u => fetch(u, { cache: 'default' }).then(r => {
+        if (r.status === 429) {
+          const e = new Error('GitHub is rate-limiting requests for this network (HTTP 429). The dashboard will retry automatically.');
+          e.rateLimited = true;
+          throw e;
+        }
         if (!r.ok) throw new Error('Could not load ' + u + ' (HTTP ' + r.status + ')');
         return r.arrayBuffer();
       });
       grab(primary).catch(e => {
-        if (primary === DATA_FALLBACK) throw e;
+        // A rate limit applies to the whole host, so falling back to another
+        // path on it would just earn a second 429.
+        if (e.rateLimited || primary === DATA_FALLBACK) throw e;
         console.warn('Falling back to the bundled data file:', e.message);
         return grab(DATA_FALLBACK);
       }).then(buf => {
+        if (cancelled) return;
         const bytes = new Uint8Array(buf);
         let text;
         if (bytes[0] === 0x1f && bytes[1] === 0x8b) text = pako.ungzip(bytes, {
           to: 'string'
         });else text = new TextDecoder().decode(bytes);
         setData(JSON.parse(text));
-      }).catch(e => setError(e.message));
+        setError(null);
+        setStale(null);
+        backoff = 0;
+        schedule(POLL_MS);
+      }).catch(e => {
+        if (cancelled) return;
+        setData(d => {
+          if (d) setStale(e.message);else setError(e.message);
+          return d;
+        });
+        backoff = e.rateLimited ? Math.min(backoff ? backoff * 2 : POLL_MS, MAX_BACKOFF_MS) : POLL_MS;
+        schedule(backoff);
+      });
     };
     load();
-    const id = setInterval(load, 60000);
-    return () => clearInterval(id);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [file]);
   return {
     data,
-    error
+    error,
+    stale
   };
 }
 
@@ -1610,7 +1664,8 @@ function BottomNav() {
 function App() {
   const {
     data,
-    error
+    error,
+    stale
   } = useData(DATA_URL);
   const [filters, setFilters] = useState({
     brand: '',
@@ -1633,12 +1688,14 @@ function App() {
   }, /*#__PURE__*/React.createElement(Spinner, null));
   return /*#__PURE__*/React.createElement(InventoryDashboard, {
     data: data,
+    stale: stale,
     filters: filters,
     setFilters: setFilters
   });
 }
 function InventoryDashboard({
   data,
+  stale,
   filters,
   setFilters
 }) {
@@ -1896,7 +1953,10 @@ function InventoryDashboard({
     section: "Inventory",
     fetchedAt: asOf,
     right: /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("strong", null, fmtNum(kpis.skus)), " SKUs")
-  }), /*#__PURE__*/React.createElement(BrandButtons, {
+  }), stale && /*#__PURE__*/React.createElement("div", {
+    className: "stale-note",
+    title: stale
+  }, "\u26a0 Showing the last data that loaded \u2014 the latest refresh failed. ", stale), /*#__PURE__*/React.createElement(BrandButtons, {
     brands: distinct.brands,
     value: filters.brand,
     onChange: b => upd('brand', b)
