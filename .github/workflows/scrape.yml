@@ -10,6 +10,11 @@ on:
   push:
     branches: [main]
   schedule:
+    # Frequent incremental refresh so "today" / "yesterday" stay current.
+    # Every 30 minutes: pulls only the last few days and MERGES into the
+    # committed file (fast). NOTE: inventory runs can be slow; cancel-in-progress
+    # stays false (see below) so a frequent trigger never kills an in-flight run.
+    - cron: '*/30 * * * *'
     # Weekly full refresh, so backdated or amended orders outside the
     # incremental window still get corrected. Sundays 09:00 UTC.
     - cron: '0 9 * * 0'
@@ -65,7 +70,9 @@ jobs:
           # scraper still does a full backfill on the first run, or any run where
           # the committed data isn't yet complete back to LEAFLINK_FROM_DATE.
           # Set to '0' (or run the Full refresh workflow) to force a full pull.
-          LEAFLINK_INCREMENTAL_DAYS: ${{ github.event_name == 'schedule' && '0' || (github.event.inputs.incremental_days || '7') }}
+          LEAFLINK_INCREMENTAL_DAYS: >-
+            ${{ (github.event_name == 'schedule' && github.event.schedule == '0 9 * * 0') && '0'
+                || (github.event.inputs.incremental_days || '7') }}
         run: python scraper.py
 
       - name: Commit updated data
